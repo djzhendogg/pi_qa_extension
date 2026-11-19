@@ -1,0 +1,21 @@
+{
+  "name": "pi-qa-goal-guardian",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal QA lifecycle and explicit stop gate for Pi",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "pi": "pi"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typebox": "1.3.27",
+    "typescript": "^5.9.0"
+  },
+  "pi": { "extensions": ["./.pi/extensions/qa.ts"] }
+}

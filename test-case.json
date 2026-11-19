@@ -1,0 +1,6 @@
+{
+  "id": "TC-001",
+  "url": "https://example.com",
+  "task": "Open the page and inspect its main heading.",
+  "expected": "The main heading is Example Domain."
+}
