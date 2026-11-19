@@ -74,10 +74,58 @@ test('persistence failure keeps terminal gate closed and records error in memory
   assert.match(run.report().reason, /report/i);
 });
 
-test('anchor retains original goal and labels success as unverified', t => {
+test('case context retains the original goal without asking to reconsider progress', t => {
   const run = new QaRun(parseTestCase(fixture), workspace(t));
-  assert.match(run.anchor(), /Create item/);
-  assert.match(run.anchor(), /Item exists/);
-  assert.match(run.anchor(), /qa_finish/);
-  assert.match(run.anchor(), /unverified/i);
+  assert.match(run.caseContext(), /Create item/);
+  assert.match(run.caseContext(), /Item exists/);
+  assert.doesNotMatch(run.caseContext(), /No independently verified progress|Inspect the current state/);
+});
+
+test('checkpoints persist reported progress and next objective without completing the case', t => {
+  const run = new QaRun(parseTestCase(fixture), workspace(t));
+  const completed = ['Form opened'];
+  run.checkpoint({ completed, current_objective: 'Fill required fields', observation: 'The form is visible' });
+  completed.push('Not actually reported');
+  const first = JSON.parse(readFileSync(run.reportPath, 'utf8'));
+  assert.equal(first.execution_status, 'running');
+  assert.equal(first.reported_verdict, null);
+  assert.equal(first.progress.source, 'agent_reported');
+  assert.deepEqual(first.progress.completed, ['Form opened']);
+  assert.equal(first.progress.current_objective, 'Fill required fields');
+  assert.equal(first.progress.revision, 1);
+  run.checkpoint({ completed: ['Form opened', 'Required fields filled'], current_objective: 'Submit the form' });
+  const second = run.report();
+  assert.equal(second.progress?.revision, 2);
+  assert.equal(second.progress?.current_objective, 'Submit the form');
+  assert.equal(second.verified_verdict, null);
+  assert.equal(run.isTerminal, false);
+});
+
+test('invalid or oversized checkpoint leaves the last usable progress unchanged', t => {
+  const run = new QaRun(parseTestCase(fixture), workspace(t));
+  run.checkpoint({ completed: [], current_objective: 'Open form' });
+  for (const invalid of [
+    { completed: [], current_objective: ' ' },
+    { completed: [''], current_objective: 'Submit' },
+    { completed: Array(21).fill('item'), current_objective: 'Submit' },
+    { completed: [], current_objective: 'x'.repeat(501) },
+    { completed: [], current_objective: 'Submit', observation: 'x'.repeat(1001) },
+  ]) assert.throws(() => run.checkpoint(invalid));
+  assert.equal(run.report().progress?.current_objective, 'Open form');
+  assert.equal(run.report().progress?.revision, 1);
+  assert.equal(run.isTerminal, false);
+});
+
+test('checkpoint cannot alter a terminal run and checkpoint write failure closes the gate', t => {
+  const dir = workspace(t);
+  const run = new QaRun(parseTestCase(fixture), dir);
+  run.finish({ verdict: 'passed', evidence: 'toast', reason: '' });
+  assert.throws(() => run.checkpoint({ completed: [], current_objective: 'Create another item' }));
+  assert.equal(run.report().progress, null);
+  const file = join(dir, 'occupied');
+  writeFileSync(file, 'not a directory');
+  const broken = new QaRun(parseTestCase(fixture), file);
+  assert.throws(() => broken.checkpoint({ completed: [], current_objective: 'Open form' }));
+  assert.equal(broken.isTerminal, true);
+  assert.equal(broken.report().execution_status, 'error');
 });

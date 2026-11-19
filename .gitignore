@@ -1,5 +1,6 @@
 node_modules/
 qa-results/
+qa-diagnostics/
 .superpowers/
 *.tsbuildinfo
 .qa-test-*/
