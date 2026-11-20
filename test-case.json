@@ -1,6 +1,5 @@
 {
-  "id": "TC-001",
+  "scenario_id": "TC-001",
   "url": "https://example.com",
-  "task": "Open the page and inspect its main heading.",
-  "expected": "The main heading is Example Domain."
+  "task": "Open the page and check that its main heading is Example Domain."
 }

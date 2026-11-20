@@ -104,11 +104,17 @@ export class QaDiagnostics {
   readonly directory: string;
   private target: { tool: string; tab: string | number } | undefined;
   private imageSequence = 0;
-  private pending = new Map<string, { revision: number; saved: boolean }>();
+  private pending = new Map<string, { revision: number; saved: boolean; tool: string }>();
 
   constructor(directory: string, runId: string) {
     if (!/^[a-f0-9-]{36}$/i.test(runId)) throw new Error('Invalid diagnostics run id');
     this.directory = resolve(directory, runId);
+  }
+
+  /** Pi supplies parentToolCallId for internal calls; model arguments cannot set it. */
+  allowsCapture(event: { toolName: string; parentToolCallId?: string }): boolean {
+    return event.parentToolCallId !== undefined &&
+      this.pending.get(event.parentToolCallId)?.tool === event.toolName;
   }
 
   private log(event: string, reason: string): void {
@@ -158,7 +164,7 @@ export class QaDiagnostics {
       this.log('capture_skipped', 'No unique Browse screenshot tool with a known tab is available');
       return;
     }
-    const pending = { revision, saved: false };
+    const pending = { revision, saved: false, tool: screenshot.name };
     this.pending.set(parentId, pending);
     try {
       const timeout = AbortSignal.timeout(10_000);

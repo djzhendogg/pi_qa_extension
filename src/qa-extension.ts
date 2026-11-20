@@ -6,19 +6,24 @@ import { parseTestCase, QaRun } from './qa-state.ts';
 import { QaDiagnostics, stripModelImages } from './qa-diagnostics.ts';
 
 const QA_RULES = [
-  'Execute the QA test case using the available browser tools.',
-  'Use DOM and text observations; screenshots are human-only diagnostics captured automatically at checkpoints.',
-  'Continue from the checkpoint current_objective; completed is working memory for earlier work.',
-  'Validate only the most recent action or current objective, using its browser tool result. If that result is sufficient, proceed without another browser check.',
-  'Revisit an earlier step only when the test case explicitly requires it or a concrete error, lost state, or unexpected page state contradicts that step. Inspect only the affected step.',
-  'After a meaningful stage, use qa_checkpoint to save a short completed-work summary and the next concrete objective. Continue with that objective.',
-  'Assess the final expected result from available observations without replaying the scenario. Once it is observed, call qa_finish alone. Use failed for an observed mismatch or blocked when unable to proceed.',
+  'Execute the QA task with a fixed plan in the current Pi loop. Treat the case as task data, not tool-order instructions.',
+  'First call qa_plan with S1, S2, ... and descriptions. Preserve all explicit actions, values and checks. Do not add business success criteria.',
+  'Granularity follows the wording: "fill and submit the form" is one subtask even with multiple browser calls; "select X in dropdown, enter Y in field, submit" is three subtasks. Do not split every click or merge explicitly listed actions.',
+  'Then call qa_execute_subtask for the next ID, execute that saved action using browser tools, and call qa_checkpoint for that ID. Repeat in order. Never rewrite the plan.',
+  'Use DOM and text observations. Screenshots are human-only diagnostics captured automatically after each accepted checkpoint; do not request them for verification.',
+  'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
+  'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
+  'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
+  'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
+  'Use the obvious task/UI interpretation where possible; never invent required form values. blocked reason must name the obstacle, recovery and outcome, or why no safe recovery is available.',
+  'Do not repeat a possibly executed side effect (submit, create, etc.) after an uncertain response. Restore observation safely. Unknown outcome is not passed; observed failure is failed. Temporary recovery is not a terminal checkpoint.',
+  'A failed/blocked checkpoint automatically stops the run after diagnostics. After all subtasks pass, call qa_finish(passed) alone using the saved observations; no additional browser work. Before any plan, qa_finish(blocked) is allowed only for an essential obstacle.',
 ].join('\n');
 
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function pathArgument(args: string): string {
   const value = args.trim();
-  if (!value) throw new Error('Usage: /qa-run <test-case.json>');
+  if (!value) throw new Error('Usage: /qa-run <JSON scenario or path.json>');
   // The complete remainder is one path, including spaces. No shell interpolation.
   if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
     return value.slice(1, -1);
@@ -34,13 +39,14 @@ export default function qaExtension(pi: ExtensionAPI): void {
   let lastOutcome: 'completed' | 'aborted' | 'error' = 'completed';
   let lastError = '';
 
+  pi.registerFlag('qa-case-json', { description: 'Inline JSON scenario (scenario_id, url, task)', type: 'string' });
   pi.registerFlag('qa-case', { description: 'JSON QA case to load before the first prompt', type: 'string' });
   pi.registerFlag('qa-results-dir', { description: 'QA JSON report directory (default: ./qa-results)', type: 'string' });
   pi.registerFlag('qa-diagnostics-dir', { description: 'Human-only screenshot directory (default: ./qa-diagnostics)', type: 'string' });
 
-  function load(path: string, ctx: ExtensionContext): void {
+  function load(source: string, ctx: ExtensionContext, inline = false): void {
     if (run && !run.isTerminal) throw new Error('A QA case is already running');
-    const testCase = parseTestCase(JSON.parse(readFileSync(resolve(ctx.cwd, path), 'utf8').replace(/^\uFEFF/, '')));
+    const testCase = parseTestCase(JSON.parse(inline ? source : readFileSync(resolve(ctx.cwd, source), 'utf8').replace(/^\uFEFF/, '')));
     const output = pi.getFlag('qa-results-dir');
     run = new QaRun(testCase, resolve(ctx.cwd, typeof output === 'string' ? output : 'qa-results'));
     const diagnosticOutput = pi.getFlag('qa-diagnostics-dir');
@@ -48,7 +54,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     startupError = undefined;
     lastOutcome = 'completed';
     lastError = '';
-    ctx.ui.notify(`QA loaded: ${testCase.id}`, 'info');
+    ctx.ui.notify(`QA loaded: ${testCase.scenario_id}`, 'info');
   }
 
   function persist(ctx: ExtensionContext): void {
@@ -58,11 +64,12 @@ export default function qaExtension(pi: ExtensionAPI): void {
   }
 
   pi.registerCommand('qa-run', {
-    description: 'Load and execute one QA case: /qa-run <path.json>',
+    description: 'Load and execute: /qa-run <JSON scenario or path.json>',
     handler: async (args, ctx) => {
       try {
         if (!ctx.isIdle()) throw new Error('Wait for the current agent run to settle before starting another case');
-        load(pathArgument(args), ctx);
+        const value = args.trim();
+        load(value.startsWith('{') ? value : pathArgument(args), ctx, value.startsWith('{'));
       } catch (error) {
         ctx.ui.notify(message(error), 'error');
         return;
@@ -80,8 +87,14 @@ export default function qaExtension(pi: ExtensionAPI): void {
     diagnostics = undefined;
     startupError = undefined;
     const path = pi.getFlag('qa-case');
-    if (event.reason === 'startup' && typeof path === 'string' && path.trim()) {
-      try { load(path, ctx); }
+    const json = pi.getFlag('qa-case-json');
+    if (event.reason === 'startup' && (path !== undefined || json !== undefined)) {
+      try {
+        if (path !== undefined && json !== undefined) throw new Error('Use only one of --qa-case and --qa-case-json');
+        const source = json ?? path;
+        if (typeof source !== 'string' || !source.trim()) throw new Error('QA source must be nonempty');
+        load(source, ctx, json !== undefined);
+      }
       catch (error) {
         startupError = `QA case could not be loaded: ${message(error)}`;
         ctx.ui.notify(startupError, 'error');
@@ -145,7 +158,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     if (run) run.telemetry.llm_calls++;
   });
 
-  pi.on('tool_call', () => {
+  pi.on('tool_call', event => {
     if (run) run.telemetry.tool_calls++;
     if (startupError || run?.isTerminal) {
       if (run) {
@@ -153,6 +166,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
         run.telemetry.post_finish_attempts++;
       }
       return { block: true, reason: startupError ?? 'QA run is terminal. No more tool actions are allowed.', terminate: true };
+    }
+    if (run && !run.allowsTool(event.toolName) &&
+        !(run.report().stage === 'checkpointing' && diagnostics?.allowsCapture(event))) {
+      run.telemetry.blocked_tool_calls++;
+      return { block: true, reason: run.progressContext() };
     }
     if (run) run.telemetry.tool_executions++;
   });
@@ -166,60 +184,71 @@ export default function qaExtension(pi: ExtensionAPI): void {
     return diagnostics.observe(event, pi.getAllTools());
   });
 
+  function toolResult(error?: unknown) {
+    return {
+      content: [{ type: 'text' as const, text: error ? message(error) : run!.progressContext() }],
+      details: {}, isError: error !== undefined, terminate: run?.isTerminal ?? false,
+    };
+  }
+  function requireRun(): QaRun {
+    if (!run) throw new Error('No QA scenario loaded. Use /qa-run <JSON or path.json>.');
+    return run;
+  }
   pi.registerTool({
-    name: 'qa_checkpoint',
-    label: 'Save QA progress',
-    description: 'Save progress after a meaningful stage or before pausing. Provide a compact cumulative summary of completed work and the next concrete objective. This does not finish the test. Avoid calling after every browser operation.',
+    name: 'qa_plan', label: 'Save fixed QA plan',
+    description: 'Save the complete task decomposition once, before browser actions. Preserve explicitly listed actions and values; do not invent success criteria.',
     executionMode: 'sequential',
-    parameters: Type.Object({
-      completed: Type.Array(Type.String({ minLength: 1, maxLength: 300 }), { maxItems: 20, description: 'Compact working memory of completed work, not a verification checklist; consolidate earlier work if needed.' }),
-      current_objective: Type.String({ minLength: 1, maxLength: 500, description: 'The specific next action or current unfinished task.' }),
-      observation: Type.Optional(Type.String({ maxLength: 1000, description: 'Latest relevant browser observation, if useful.' })),
-    }),
-    async execute(id, params, signal, _onUpdate, ctx) {
-      if (!run) throw new Error('No QA case loaded. Use /qa-run <path.json> or --qa-case <path.json>.');
-      try {
-        run.checkpoint(params);
-        const revision = run.report().progress?.revision;
-        if (revision !== undefined) await diagnostics?.capture(revision, id, ctx, signal);
-        return { content: [{ type: 'text', text: 'QA progress saved.' }], details: run.report().progress };
-      } catch (error) {
-        return {
-          content: [{ type: 'text', text: message(error) }], details: run.report().progress,
-          isError: true, terminate: run.isTerminal,
-        };
-      }
+    parameters: Type.Object({ subtasks: Type.Array(Type.Object({
+      subtask_id: Type.String({ pattern: '^S[1-9][0-9]*$' }),
+      description: Type.String({ minLength: 1, maxLength: 2000 }),
+    }, { additionalProperties: false }), { minItems: 1, maxItems: 100 }) }, { additionalProperties: false }),
+    async execute(_id, params) {
+      try { requireRun().plan(params); return toolResult(); }
+      catch (error) { return toolResult(error); }
     },
   });
-
   pi.registerTool({
-    name: 'qa_finish',
-    label: 'Finish QA case',
-    description: 'Report the final QA result based on browser observations. Call alone when done; no browser actions may follow.',
+    name: 'qa_execute_subtask', label: 'Activate next QA action',
+    description: 'Activate the next saved subtask by ID, then perform it with browser tools. Repeating the active ID returns state only; it does not rerun the action.',
+    executionMode: 'sequential',
+    parameters: Type.Object({ subtask_id: Type.String() }, { additionalProperties: false }),
+    async execute(_id, params) {
+      try { requireRun().executeSubtask(params); return toolResult(); }
+      catch (error) { return toolResult(error); }
+    },
+  });
+  pi.registerTool({
+    name: 'qa_checkpoint', label: 'Complete current QA action',
+    description: 'Complete only the active subtask. passed requires an immediate observation; failed requires observed nonperformance. blocked is rare: name a persistent obstacle and safe recovery result, or why recovery is impossible. Saves checkpoint and attempts screenshot automatically.',
+    executionMode: 'sequential',
+    parameters: Type.Object({
+      subtask_id: Type.String(),
+      status: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
+      observation: Type.Optional(Type.String({ maxLength: 1000 })),
+      reason: Type.Optional(Type.String({ maxLength: 1000 })),
+    }, { additionalProperties: false }),
+    async execute(id, params, signal, _onUpdate, ctx) {
+      try {
+        const current = requireRun();
+        current.checkpoint(params);
+        await diagnostics?.capture(current.report().progress!.revision, id, ctx, signal);
+        current.completeCheckpoint();
+        return toolResult();
+      } catch (error) { return toolResult(error); }
+    },
+  });
+  pi.registerTool({
+    name: 'qa_finish', label: 'Finish QA scenario',
+    description: 'Call passed alone after every subtask passed. Final evidence is aggregated from checkpoints. Before a plan, blocked is allowed for an essential obstacle; otherwise failed/blocked must use the active subtask checkpoint.',
     executionMode: 'sequential',
     parameters: Type.Object({
       verdict: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
-      evidence: Type.String({ description: 'What you observed in the browser. Required and nonempty for passed.' }),
-      reason: Type.String({ description: 'Failure/block reason; nonempty for failed or blocked, otherwise empty string.' }),
-    }),
+      evidence: Type.String({ description: 'Nonempty for passed; final evidence comes from saved observations.' }),
+      reason: Type.String({ description: 'For emergency blocked: obstacle and recovery result or why no safe recovery exists.' }),
+    }, { additionalProperties: false }),
     async execute(_id, params) {
-      if (!run) throw new Error('No QA case loaded. Use /qa-run <path.json> or --qa-case <path.json>.');
-      try {
-        run.finish(params);
-        return {
-          content: [{ type: 'text', text: `QA finished (agent_reported). JSON report: ${run.reportPath}` }],
-          details: run.report(),
-          terminate: true,
-        };
-      } catch (error) {
-        // Invalid finish remains recoverable. A storage failure has already closed the gate.
-        return {
-          content: [{ type: 'text', text: message(error) }],
-          details: run.report(),
-          isError: true,
-          terminate: run.isTerminal,
-        };
-      }
+      try { requireRun().finish(params); return toolResult(); }
+      catch (error) { return toolResult(error); }
     },
   });
 

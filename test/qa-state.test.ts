@@ -4,128 +4,163 @@ import { dirname, join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { parseTestCase, QaRun } from '../src/qa-state.ts';
 
-const fixture = { id: '../TC-001', url: 'https://example.com', task: 'Create item', expected: 'Item exists' };
+const fixture = { scenario_id: '../TC-001', url: 'https://example.com', task: 'Create item' };
+const subtasks = [{ subtask_id: 'S1', description: 'Fill and submit form' }, { subtask_id: 'S2', description: 'Check list' }];
 function workspace(t: TestContext) {
-  // Sandbox permits atomic renames inside the workspace, unlike its redirected TEMP.
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
-  t.after(() => {
-    assert.equal(dirname(dir), process.cwd());
-    rmSync(dir, { recursive: true, force: true });
-  });
+  t.after(() => { assert.equal(dirname(dir), process.cwd()); rmSync(dir, { recursive: true, force: true }); });
   return dir;
 }
+function planned(t: TestContext) {
+  const run = new QaRun(parseTestCase(fixture), workspace(t));
+  run.plan({ subtasks });
+  return run;
+}
+const result = (subtask_id = 'S1', status = 'passed', observation = 'Selected value visible', reason = '') => ({ subtask_id, status, observation, reason });
+const finish = { verdict: 'passed', evidence: 'Untrusted final claim', reason: '' };
 
-test('rejects missing expected and unsafe URL schemes without changing task text', () => {
-  for (const input of [null, {}, { ...fixture, expected: ' ' }, { ...fixture, url: 'file:///secret' }]) {
-    assert.throws(() => parseTestCase(input));
-  }
-  const input = { ...fixture, task: '  Original task\nwith details  ' };
+test('new input has scenario_id and no expected; preserves original task and rejects old schema', () => {
+  for (const input of [null, {}, { id: 'old', url: fixture.url, task: 't', expected: 'x' }, { ...fixture, url: 'http' }, { ...fixture, url: 'https:example.com' }, { ...fixture, url: 'http:/example.com' }, { ...fixture, url: 'file:///x' }, { ...fixture, scenario_id: ' ' }, { ...fixture, expected: 'hidden criterion' }]) assert.throws(() => parseTestCase(input));
+  const input = { ...fixture, task: '  Original\n"quoted" text  ' };
   const parsed = parseTestCase(input);
-  input.task = 'Changed';
-  assert.equal(parsed.task, '  Original task\nwith details  ');
+  input.task = 'changed';
+  assert.equal(parsed.task, '  Original\n"quoted" text  ');
   assert.ok(Object.isFrozen(parsed));
+  assert.equal('expected' in parsed, false);
 });
 
-test('finish stores only an agent-reported verdict and is idempotent', t => {
-  const dir = workspace(t);
-  const run = new QaRun(parseTestCase(fixture), dir);
-  run.finish({ verdict: 'passed', evidence: 'Toast visible', reason: '' });
-  run.finish({ verdict: 'failed', evidence: '', reason: 'late result' });
-  const result = JSON.parse(readFileSync(run.reportPath, 'utf8'));
-  assert.equal(result.execution_status, 'completed');
-  assert.equal(result.reported_verdict, 'passed');
-  assert.equal(result.verification_status, 'agent_reported');
-  assert.equal(result.verified_verdict, null);
-  assert.equal(result.telemetry.post_success_actions, null);
-  assert.equal(result.test_case.task, 'Create item');
-  assert.equal(readdirSync(dir).length, 1);
-});
-
-test('invalid finish leaves run active; invalid verdict and whitespace evidence are rejected', t => {
+test('plan is validated atomically, immutable, bounded and accepted once', t => {
   const run = new QaRun(parseTestCase(fixture), workspace(t));
-  for (const input of [
-    { verdict: 'passed', evidence: ' ', reason: '' },
-    { verdict: 'failed', evidence: '', reason: '' },
-    { verdict: 'blocked', evidence: '', reason: '' },
-    { verdict: 'unknown', evidence: 'claim', reason: '' },
-  ]) assert.throws(() => run.finish(input));
+  for (const input of [{ subtasks: [] }, { subtasks: [{ subtask_id: 'S2', description: 'x' }] }, { subtasks: [{ subtask_id: 'S1', description: ' ' }] }, { subtasks: [{ ...subtasks[0], expected_result: 'x' }] }, { subtasks: Array(101).fill(subtasks[0]) }, { subtasks: [{ subtask_id: 'S1', description: 'x'.repeat(2001) }] }]) assert.throws(() => run.plan(input));
+  assert.equal(run.report().stage, 'planning');
+  const input = structuredClone(subtasks);
+  run.plan({ subtasks: input });
+  input[0].description = 'changed';
+  assert.equal(run.report().plan[0].description, subtasks[0].description);
+  assert.throws(() => run.plan({ subtasks }));
+  assert.equal(run.report().stage, 'ready');
+});
+
+test('gate and activation enforce ordered work; repeated activation is harmless', t => {
+  const run = new QaRun(parseTestCase(fixture), workspace(t));
+  assert.equal(run.allowsTool('browser_execute'), false);
+  assert.throws(() => run.executeSubtask({ subtask_id: 'S1' }));
+  run.plan({ subtasks });
+  assert.equal(run.allowsTool('browser_execute'), false);
+  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
+  run.executeSubtask({ subtask_id: 'S1' });
+  run.executeSubtask({ subtask_id: 'S1' });
+  assert.equal(run.report().active_subtask_id, 'S1');
+  assert.equal(run.allowsTool('browser_execute'), true);
+  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
+  assert.throws(() => run.finish(finish));
+});
+
+test('checkpoint persists before diagnostics; no next action until completion; final evidence is aggregated', t => {
+  const run = planned(t);
+  run.executeSubtask({ subtask_id: 'S1' });
+  run.checkpoint(result());
+  assert.equal(run.report().stage, 'checkpointing');
+  assert.equal(run.allowsTool('browser_execute'), false);
+  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
+  assert.throws(() => run.checkpoint(result()));
+  const saved = JSON.parse(readFileSync(run.reportPath, 'utf8'));
+  assert.equal(saved.subtask_results[0].revision, 1);
+  assert.equal(saved.execution_status, 'running');
+  run.completeCheckpoint();
+  assert.equal(run.report().stage, 'ready');
+  run.executeSubtask({ subtask_id: 'S2' });
+  run.checkpoint(result('S2', 'passed', 'List checked'));
+  run.completeCheckpoint();
+  assert.equal(run.report().stage, 'awaiting_finish');
+  assert.equal(run.allowsTool('browser_execute'), false);
+  assert.throws(() => run.finish({ verdict: 'failed', evidence: '', reason: 'invented' }));
+  run.finish(finish);
+  run.finish({ verdict: 'failed', evidence: '', reason: 'late' });
+  const report = run.report();
+  assert.equal(report.reported_verdict, 'passed');
+  assert.equal(report.evidence, 'S1: Selected value visible\nS2: List checked');
+  assert.equal(report.schema_version, 2);
+  assert.equal(report.scenario_id, fixture.scenario_id);
+  assert.equal(report.verification_status, 'agent_reported');
+  assert.equal(report.verified_verdict, null);
+  assert.equal(readdirSync(dirname(run.reportPath)).length, 1);
+});
+
+for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint finishes after diagnostics, including abort in between`, t => {
+  const run = planned(t);
+  run.executeSubtask({ subtask_id: 'S1' });
+  run.checkpoint(result('S1', status, '', 'Browser unavailable after reconnect attempt'));
   assert.equal(run.isTerminal, false);
+  run.end('aborted', 'User abort during screenshot');
+  assert.equal(run.report().reported_verdict, status);
+  assert.equal(run.report().execution_status, 'completed');
+  assert.equal(run.report().subtask_results.length, 1);
+  assert.equal(run.report().plan.length, 2);
+  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
 });
 
-test('unique report names cannot escape output directory through case id', t => {
-  const dir = workspace(t);
-  const first = new QaRun(parseTestCase(fixture), dir);
-  const second = new QaRun(parseTestCase(fixture), dir);
-  first.end('incomplete', 'No qa_finish');
-  second.end('aborted', 'User interrupted');
-  assert.notEqual(first.reportPath, second.reportPath);
-  assert.equal(readdirSync(dir).length, 2);
-  assert.equal(JSON.parse(readFileSync(first.reportPath, 'utf8')).reported_verdict, null);
-});
-
-test('persistence failure keeps terminal gate closed and records error in memory', t => {
-  const dir = workspace(t);
-  const file = join(dir, 'not-a-directory');
-  writeFileSync(file, 'occupied');
-  const run = new QaRun(parseTestCase(fixture), file);
-  assert.throws(() => run.finish({ verdict: 'passed', evidence: 'toast', reason: '' }));
-  assert.equal(run.isTerminal, true);
-  assert.equal(run.report().execution_status, 'error');
-  assert.match(run.report().reason, /report/i);
-});
-
-test('case context retains the original goal without asking to reconsider progress', t => {
-  const run = new QaRun(parseTestCase(fixture), workspace(t));
-  assert.match(run.caseContext(), /Create item/);
-  assert.match(run.caseContext(), /Item exists/);
-  assert.doesNotMatch(run.caseContext(), /No independently verified progress|Inspect the current state/);
-});
-
-test('checkpoints persist reported progress and next objective without completing the case', t => {
-  const run = new QaRun(parseTestCase(fixture), workspace(t));
-  const completed = ['Form opened'];
-  run.checkpoint({ completed, current_objective: 'Fill required fields', observation: 'The form is visible' });
-  completed.push('Not actually reported');
-  const first = JSON.parse(readFileSync(run.reportPath, 'utf8'));
-  assert.equal(first.execution_status, 'running');
-  assert.equal(first.reported_verdict, null);
-  assert.equal(first.progress.source, 'agent_reported');
-  assert.deepEqual(first.progress.completed, ['Form opened']);
-  assert.equal(first.progress.current_objective, 'Fill required fields');
-  assert.equal(first.progress.revision, 1);
-  run.checkpoint({ completed: ['Form opened', 'Required fields filled'], current_objective: 'Submit the form' });
-  const second = run.report();
-  assert.equal(second.progress?.revision, 2);
-  assert.equal(second.progress?.current_objective, 'Submit the form');
-  assert.equal(second.verified_verdict, null);
-  assert.equal(run.isTerminal, false);
-});
-
-test('invalid or oversized checkpoint leaves the last usable progress unchanged', t => {
-  const run = new QaRun(parseTestCase(fixture), workspace(t));
-  run.checkpoint({ completed: [], current_objective: 'Open form' });
-  for (const invalid of [
-    { completed: [], current_objective: ' ' },
-    { completed: [''], current_objective: 'Submit' },
-    { completed: Array(21).fill('item'), current_objective: 'Submit' },
-    { completed: [], current_objective: 'x'.repeat(501) },
-    { completed: [], current_objective: 'Submit', observation: 'x'.repeat(1001) },
-  ]) assert.throws(() => run.checkpoint(invalid));
-  assert.equal(run.report().progress?.current_objective, 'Open form');
+test('invalid checkpoint does not mutate active task or revision', t => {
+  const run = planned(t);
+  run.executeSubtask({ subtask_id: 'S1' });
+  for (const input of [result('S2'), result('S1', 'passed', ' '), result('S1', 'blocked', '', ''), result('S1', 'failed', '', ''), result('S1', 'unknown'), result('S1', 'passed', 'x'.repeat(1001))]) assert.throws(() => run.checkpoint(input));
+  assert.equal(run.report().stage, 'executing');
+  assert.equal(run.report().subtask_results.length, 0);
+  run.checkpoint(result());
+  run.completeCheckpoint();
+  assert.throws(() => run.checkpoint(result()));
   assert.equal(run.report().progress?.revision, 1);
-  assert.equal(run.isTerminal, false);
 });
 
-test('checkpoint cannot alter a terminal run and checkpoint write failure closes the gate', t => {
+test('only blocked emergency finish is available before plan', t => {
+  const run = new QaRun(parseTestCase(fixture), workspace(t));
+  assert.throws(() => run.finish(finish));
+  assert.throws(() => run.finish({ verdict: 'blocked', evidence: '', reason: ' ' }));
+  run.finish({ verdict: 'blocked', evidence: '', reason: 'Required credentials missing; no safe recovery available' });
+  assert.equal(run.report().reported_verdict, 'blocked');
+  assert.throws(() => run.plan({ subtasks }));
+});
+
+test('compact context restores current task without repeating complete plan or past descriptions', t => {
+  const run = planned(t);
+  assert.match(run.progressContext()!, /qa_execute_subtask/);
+  run.executeSubtask({ subtask_id: 'S1' });
+  run.checkpoint(result()); run.completeCheckpoint();
+  run.executeSubtask({ subtask_id: 'S2' });
+  assert.match(run.progressContext()!, /Check list/);
+  assert.doesNotMatch(run.progressContext()!, /Fill and submit form/);
+  assert.match(run.progressContext()!, /Selected value visible/);
+  assert.match(run.caseContext(), /Create item/);
+});
+
+test('unique report names and technical settlement without a verdict', t => {
+  const dir = workspace(t);
+  const one = new QaRun(parseTestCase(fixture), dir), two = new QaRun(parseTestCase(fixture), dir);
+  one.end('incomplete', 'Agent stopped'); two.end('aborted', 'User stopped');
+  assert.notEqual(one.reportPath, two.reportPath);
+  assert.equal(one.report().reported_verdict, null);
+  assert.equal(readdirSync(dir).length, 2);
+});
+
+test('storage failure closes gate and retains accepted checkpoint', t => {
   const dir = workspace(t);
   const run = new QaRun(parseTestCase(fixture), dir);
-  run.finish({ verdict: 'passed', evidence: 'toast', reason: '' });
-  assert.throws(() => run.checkpoint({ completed: [], current_objective: 'Create another item' }));
-  assert.equal(run.report().progress, null);
-  const file = join(dir, 'occupied');
-  writeFileSync(file, 'not a directory');
-  const broken = new QaRun(parseTestCase(fixture), file);
-  assert.throws(() => broken.checkpoint({ completed: [], current_objective: 'Open form' }));
-  assert.equal(broken.isTerminal, true);
-  assert.equal(broken.report().execution_status, 'error');
+  run.plan({ subtasks }); run.executeSubtask({ subtask_id: 'S1' });
+  rmSync(dir, { recursive: true, force: true }); writeFileSync(dir, 'occupied');
+  assert.throws(() => run.checkpoint(result()));
+  assert.equal(run.report().execution_status, 'error');
+  assert.equal(run.report().subtask_results.length, 1);
+  assert.equal(run.allowsTool('browser_execute'), false);
+  run.end('aborted', 'late');
+  assert.equal(run.report().execution_status, 'error');
+});
+
+test('terminal state names accepted outcome and never presents pending task as current', t => {
+  const run = planned(t); run.executeSubtask({ subtask_id: 'S1' });
+  run.checkpoint(result('S1', 'blocked', '', 'Required login unavailable after recovery'));
+  run.completeCheckpoint();
+  const context = run.progressContext();
+  assert.doesNotMatch(context, /Check list/);
+  assert.match(context, /blocked/);
+  assert.match(context, /Required login unavailable after recovery/);
 });

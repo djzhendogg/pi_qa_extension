@@ -15,15 +15,21 @@ const model: Model<'openai-completions'> = {
 };
 const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_finish', arguments: { verdict: 'passed', evidence: 'Success toast observed', reason: '' } });
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
-const checkpoint = (id: string, completed: string[], objective: string): ToolCall => ({
-  type: 'toolCall', id, name: 'qa_checkpoint', arguments: { completed, current_objective: objective },
-});
+const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
+const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
+const activate = (id = 'S1') => call('qa_execute_subtask', 'activate-'+id, { subtask_id: id });
+const checkpoint = (id = 'S1', status = 'passed', observation = 'Value visible', reason = '') => call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status, observation, reason });
+const success = () => [plan(), activate(), browser('work'), checkpoint(), finish()];
+const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
+const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
+
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage' } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void> } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
-  writeFileSync(casePath, JSON.stringify({ id: 'TC-001', url: 'https://example.com', task: 'Create the item exactly once', expected: options.invalidCase ? '' : 'The item exists' }));
+  const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
+  writeFileSync(casePath, caseJson);
   const settings = SettingsManager.inMemory({
     compaction: { enabled: options.compaction ?? false, keepRecentTokens: 1, reserveTokens: 32 },
     retry: { enabled: options.retry ?? false, maxRetries: 1, baseDelayMs: 1 }, packages: [],
@@ -47,7 +53,8 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   });
   await loader.reload();
   assert.equal(loader.getExtensions().errors.length, 0);
-  if (options.startupCase) loader.getExtensions().runtime.flagValues.set('qa-case', casePath);
+  if (options.startupJson || options.conflict) loader.getExtensions().runtime.flagValues.set('qa-case-json', caseJson);
+  if (options.startupCase || options.conflict) loader.getExtensions().runtime.flagValues.set('qa-case', casePath);
   if (options.brokenOutput) {
     const file = join(dir, 'occupied');
     writeFileSync(file, 'not a directory');
@@ -78,6 +85,8 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       parameters: Type.Object({ tab: Type.String(), format: Type.Optional(Type.Literal('png')) }),
       async execute(_id, params) {
         screenshotCalls.push(params);
+        options.captureStarted?.();
+        await options.captureWait;
         if (options.screenshots === 'error') throw new Error('Screenshot backend unavailable');
         return {
           content: [{ type: 'image', data: png, mimeType: 'image/png' }],
@@ -154,7 +163,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
     requests: () => requests,
     compactions: () => compactions,
     async run() {
-      if (options.startupCase) await session.prompt('Execute QA case');
+      if (options.startupCase || options.startupJson || options.conflict) await session.prompt('Execute QA case');
       else {
         // sendUserMessage intentionally schedules asynchronously. The command can
         // return before Pi marks the run busy; wait for its actual settlement event.
@@ -162,7 +171,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
           const unsubscribe = session.subscribe(event => {
             if (event.type === 'agent_settled') { unsubscribe(); resolve(); }
           });
-          void session.prompt(`/qa-run "${casePath}"`).catch(error => { unsubscribe(); reject(error); });
+          void session.prompt(options.inline ? `/qa-run ${caseJson}` : `/qa-run "${casePath}"`).catch(error => { unsubscribe(); reject(error); });
         });
       }
       await session.waitForIdle();
@@ -173,285 +182,158 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
     },
   };
 }
-
-for (const [name, calls, expectedActions] of [
-  ['finish alone', [finish()], []],
-  ['finish then browser', [finish(), browser('after')], []],
-  ['browser then finish then browser', [browser('before'), finish(), browser('after')], ['before']],
-  ['duplicate finish', [finish('first'), finish('second')], []],
-] as const) {
-  test(`${name}: preserves tool results and sends no further provider request`, async t => {
-    const env = await setup(t, [{ calls: [...calls] }]);
+for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: true, startupCase: true }]) {
+  test(`full lifecycle via ${JSON.stringify(options)}`, async t => {
+    const env = await setup(t, [{ calls: success() }], options);
     await env.run();
-    assert.deepEqual(env.actions, expectedActions);
-    assert.equal(env.requests(), 1);
+    assert.deepEqual(env.actions, ['work']);
     const [report] = env.reports();
-    assert.equal(report.execution_status, 'completed');
     assert.equal(report.reported_verdict, 'passed');
+    assert.equal(report.execution_status, 'completed');
+    assert.equal(report.scenario_id, 'TC-001');
+    assert.equal(report.subtask_results.length, 1);
+    assert.equal(report.progress.revision, 1);
     assert.equal(report.verified_verdict, null);
-    assert.equal(report.telemetry.llm_calls, 1);
-    const results = env.session.messages.filter(m => m.role === 'toolResult');
-    assert.equal(results.length, calls.length);
+    assert.equal(env.requests(), 1);
     assert.deepEqual(env.extensionErrors, []);
   });
 }
 
-test('browser results remain the latest messages and QA case stays in stable system context', async t => {
-  const env = await setup(t, [{ calls: [browser('open')] }, { calls: [browser('error')] }, { calls: [finish()] }], { startupCase: true });
-  await env.run();
-  assert.equal(env.requests(), 3);
-  const systemPrompt = getCurrentSystemPrompt(env.contexts[0].messages);
-  assert.match(systemPrompt, /Create the item exactly once/);
-  assert.match(systemPrompt, /The item exists/);
-  assert.doesNotMatch(systemPrompt, /No independently verified progress|Your evidence is unverified/);
-  for (const [index, context] of env.contexts.entries()) {
-    assert.equal(getCurrentSystemPrompt(context.messages), systemPrompt);
-    assert.equal(context.messages.filter(m => m.role === 'user').length, 1);
-    if (index > 0) assert.equal(context.messages.at(-1)?.role, 'toolResult');
-  }
-  assert.equal(env.reports()[0].telemetry.tool_errors, 1);
-});
-
-test('invalid finish does not close gate or prevent subsequent legitimate work', async t => {
-  const invalid = finish();
-  invalid.arguments.evidence = ' ';
-  const env = await setup(t, [{ calls: [invalid, browser('recover')] }, { calls: [finish('valid')] }]);
-  await env.run();
-  assert.deepEqual(env.actions, ['recover']);
-  assert.equal(env.reports()[0].execution_status, 'completed');
-  assert.equal(env.requests(), 2);
-});
-
-for (const [stopReason, status] of [['stop', 'incomplete'], ['error', 'error'], ['aborted', 'aborted']] as const) {
-  test(`settlement with ${stopReason} writes ${status} without a QA verdict`, async t => {
-    const env = await setup(t, [{ stopReason, errorMessage: stopReason === 'error' ? 'Inference unavailable' : undefined }]);
-    await env.run();
-    const [report] = env.reports();
-    assert.equal(report.execution_status, status);
-    assert.equal(report.reported_verdict, null);
-  });
-}
-
-test('report write failure stops further tools and model requests', async t => {
-  const env = await setup(t, [{ calls: [browser('before'), finish(), browser('after')] }], { brokenOutput: true });
-  await env.run();
-  assert.deepEqual(env.actions, ['before']);
-  assert.equal(env.requests(), 1);
-  const results = env.session.messages.filter(m => m.role === 'toolResult');
-  assert.ok(results.some(result => result.role === 'toolResult' && result.toolName === 'qa_finish' && result.isError));
-});
-
-test('entry point loads from disk in Pi and can finish a case', async t => {
-  const env = await setup(t, [{ calls: [finish()] }], { fromDisk: true, startupCase: true });
-  await env.run();
-  assert.equal(env.reports()[0].execution_status, 'completed');
-  assert.deepEqual(env.extensionErrors, []);
-});
-
-test('two explicit runs have independent reports and counters', async t => {
-  const env = await setup(t, [{ calls: [finish('first')] }, { calls: [finish('second')] }]);
-  await env.run();
-  await env.run();
-  assert.equal(env.requests(), 2);
-  const reports = env.reports();
-  assert.equal(reports.length, 2);
-  assert.notEqual(reports[0].run_id, reports[1].run_id);
-  assert.ok(reports.every(r => r.execution_status === 'completed' && r.telemetry.llm_calls === 1));
-});
-
-test('completed case blocks a later prompt and malformed replacement does not reopen it', async t => {
-  const env = await setup(t, [{ calls: [finish()] }, { calls: [browser('must-not-run')] }]);
-  await env.run();
-  await env.session.prompt('/qa-run missing-case.json');
-  await env.session.prompt('Continue creating items');
-  await env.session.waitForIdle();
-  assert.equal(env.requests(), 1);
-  assert.deepEqual(env.actions, []);
-  assert.equal(env.reports().length, 1);
-  assert.equal(env.reports()[0].execution_status, 'completed');
-});
-
-test('invalid --qa-case fails closed before any provider or browser request', async t => {
-  const env = await setup(t, [{ calls: [browser('must-not-run')] }], { startupCase: true, invalidCase: true });
-  await env.run();
-  assert.equal(env.requests(), 0);
-  assert.deepEqual(env.actions, []);
-});
-
-test('real user abort during a request produces an aborted report', { timeout: 10000 }, async t => {
-  const env = await setup(t, [{ waitForAbort: true }]);
-  const running = env.run();
-  await env.whenRequested;
-  await env.session.abort();
-  await running;
-  assert.equal(env.reports()[0].execution_status, 'aborted');
-  assert.equal(env.reports()[0].reported_verdict, null);
-});
-
-test('reload finalizes a loaded unstarted case and does not silently resume it', async t => {
-  const env = await setup(t, [], { startupCase: true });
-  await env.session.reload();
-  assert.equal(env.reports()[0].execution_status, 'incomplete');
-  await env.session.prompt('A normal Pi prompt');
-  assert.equal(env.reports().length, 1);
+test('stage gates reject premature browser, finish and skipped activation in mixed packet', async t => {
+  const calls = [browser('before-plan'), finish('premature'), plan(2), browser('before-active'), activate('S2'), activate(), browser('first'), checkpoint(), browser('between'), activate('S2'), browser('second'), checkpoint('S2'), browser('after-tasks'), finish(), browser('after-finish')];
+  const env = await setup(t, [{ calls }]); await env.run();
+  assert.deepEqual(env.actions, ['first', 'second']);
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+  assert.equal(env.session.messages.filter(m => m.role === 'toolResult').length, calls.length);
   assert.equal(env.requests(), 1);
 });
 
-test('terminal case cancels manual compaction before a summarization request', async t => {
-  const env = await setup(t, [{ calls: [browser('inspect')] }, { calls: [finish()] }], { compaction: true });
-  await env.run();
-  await assert.rejects(env.session.compact(), /cancelled/i);
-  assert.equal(env.requests(), 2);
+test('invalid checkpoint stays recoverable and duplicate cannot add a revision', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), checkpoint('S1', 'passed', ' '), browser('recover'), checkpoint(), checkpoint(), finish()] }]);
+  await env.run(); assert.deepEqual(env.actions, ['recover']);
+  assert.equal(env.reports()[0].subtask_results.length, 1);
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
 });
 
-test('terminal case stops scheduled cache warming without emitting swallowed provider-hook errors', async t => {
-  const env = await setup(t, [{ calls: [finish()] }]);
-  await env.run();
-  const action = await env.session.extensionRunner.emitCacheWarmingDecision({
-    type: 'cache_warming_decision', action: 'warm', warmCost: 0, missCost: 1, continuationProbability: 1,
-  });
-  assert.equal(action, 'stop');
-  await env.session.extensionRunner.emitBeforeProviderRequest({ late: true });
-  assert.deepEqual(env.extensionErrors, []);
-  assert.equal(env.requests(), 1);
-});
-
-test('Pi automatic retry can recover and finish without an intermediate incomplete report', async t => {
-  const env = await setup(t, [{ stopReason: 'error', errorMessage: '503 Service Unavailable' }, { calls: [finish()] }], { retry: true });
-  await env.run();
-  assert.equal(env.requests(), 2);
-  const reports = env.reports();
-  assert.equal(reports.length, 1);
-  assert.equal(reports[0].execution_status, 'completed');
-  assert.equal(reports[0].telemetry.llm_calls, 2);
-});
-
-test('checkpoint updates the current objective in system context without injecting user messages', async t => {
-  const env = await setup(t, [
-    { calls: [browser('open')] },
-    { calls: [checkpoint('opened', ['Form opened'], 'Fill required fields')] },
-    { calls: [browser('fill')] },
-    { calls: [checkpoint('filled', ['Form opened', 'Required fields filled'], 'Submit and observe result')] },
-    { calls: [finish()] },
-  ]);
-  await env.run();
-  assert.equal(env.requests(), 5);
-  const progress = env.contexts.map(context => getCurrentSystemMessage(context.messages)?.sections?.qa_goal_guardian_progress);
-  assert.equal(progress[0], undefined);
-  assert.equal(progress[1], undefined);
-  assert.match(progress[2] ?? '', /Fill required fields/);
-  assert.equal(progress[2], progress[3]);
-  assert.match(progress[4] ?? '', /Submit and observe result/);
-  assert.doesNotMatch(progress[4] ?? '', /Fill required fields/);
-  for (const [index, context] of env.contexts.entries()) {
-    assert.equal(context.messages.filter(m => m.role === 'user').length, 1);
-    if (index > 0) assert.equal(context.messages.at(-1)?.role, 'toolResult');
-    assert.deepEqual(getCurrentTools(context.messages).map(tool => tool.name).sort(), ['browser_execute', 'qa_checkpoint', 'qa_finish']);
-  }
+for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint captures once and stops later siblings`, async t => {
+  const env = await setup(t, [{ calls: [plan(2), activate(), navigate(), checkpoint('S1', status, '', 'Missing credentials; no safe recovery available'), screenshot(), activate('S2'), browser('after')] }], { screenshots: 'ok' });
+  await env.run(); assert.deepEqual(env.actions, ['navigate']);
+  assert.equal(env.screenshotCalls.length, 1);
   const [report] = env.reports();
-  assert.equal(report.progress.revision, 2);
-  assert.equal(report.progress.source, 'agent_reported');
-  assert.equal(report.progress.current_objective, 'Submit and observe result');
-  assert.equal(report.verified_verdict, null);
-  assert.deepEqual(env.actions, ['open', 'fill']);
+  assert.equal(report.reported_verdict, status);
+  assert.equal(report.subtask_results.length, 1);
+  assert.ok(existsSync(join(env.dir, 'qa-diagnostics', report.run_id, 'checkpoint-001.png')));
+  assert.equal(env.requests(), 1); assert.deepEqual(env.extensionErrors, []);
 });
 
-test('terminal finish blocks a later checkpoint as well as browser actions', async t => {
-  const env = await setup(t, [{ calls: [finish(), checkpoint('too-late', [], 'Restart'), browser('too-late')] }]);
-  await env.run();
-  const [report] = env.reports();
-  assert.equal(report.execution_status, 'completed');
-  assert.equal(report.progress, null);
-  assert.equal(report.telemetry.blocked_tool_calls, 2);
-  assert.deepEqual(env.actions, []);
+test('next subtask waits for capture; screenshot name cannot bypass gate', async t => {
+  let started!: () => void, release!: () => void;
+  const captured = new Promise<void>(r => { started = r; });
+  const wait = new Promise<void>(r => { release = r; });
+  const env = await setup(t, [{ calls: [plan(2), activate(), navigate(), checkpoint(), activate('S2'), browser('second'), checkpoint('S2'), finish()] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const running = env.run(); await captured;
+  assert.equal(env.reports()[0].stage, 'checkpointing');
+  assert.equal(env.reports()[0].subtask_results.length, 1);
+  assert.deepEqual(env.actions, ['navigate']);
+  const gate = await env.session.extensionRunner.emitToolCall({ type: 'tool_call', toolName: 'mcp__browse__screenshot', toolCallId: 'forged', input: { tab: 'chrome:7' } });
+  assert.equal(gate?.block, true);
+  const nested = await env.session.extensionRunner.emitToolCall({ type: 'tool_call', toolName: 'mcp__browse__screenshot', toolCallId: 'forged/0', parentToolCallId: 'other', input: { tab: 'chrome:7' } });
+  assert.equal(nested?.block, true);
+  release(); await running;
+  assert.deepEqual(env.actions, ['navigate', 'second']); assert.equal(env.screenshotCalls.length, 2);
 });
 
-test('progress and original case survive automatic history compaction', async t => {
-  const env = await setup(t, [
-    { calls: [checkpoint('saved', ['Form filled'], 'Submit without restarting')], usageInput: 128000 },
-    { calls: [finish()] },
-  ], { compaction: true, compactionFixture: true });
-  await env.run();
-  assert.ok(env.compactions() >= 1);
-  assert.equal(env.requests(), 2);
-  const context = env.contexts[1];
-  assert.match(getCurrentSystemPrompt(context.messages), /Create the item exactly once/);
-  assert.match(getCurrentSystemPrompt(context.messages), /Submit without restarting/);
-  assert.equal(env.reports()[0].progress.revision, 1);
-  assert.deepEqual(env.extensionErrors, []);
+test('abort during failed capture preserves accepted verdict', async t => {
+  let started!: () => void, release!: () => void;
+  const captured = new Promise<void>(r => { started = r; });
+  const wait = new Promise<void>(r => { release = r; });
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint('S1', 'failed', '', 'Value did not change'), browser('after')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const running = env.run(); await captured;
+  const aborting = env.session.abort(); release(); await aborting; await running;
+  assert.equal(env.reports()[0].reported_verdict, 'failed');
+  assert.equal(env.reports()[0].subtask_results.length, 1);
+  assert.deepEqual(env.actions, ['navigate']);
 });
 
-test('a new case starts without progress from the previous case', async t => {
-  const env = await setup(t, [
-    { calls: [checkpoint('saved', ['Form opened'], 'Fill fields')] },
-    { calls: [finish('first')] }, { calls: [finish('second')] },
-  ]);
-  await env.run();
-  await env.run();
-  assert.equal(env.requests(), 3);
-  assert.equal(getCurrentSystemMessage(env.contexts[2].messages)?.sections?.qa_goal_guardian_progress, undefined);
-  const reports = env.reports();
-  assert.equal(reports.length, 2);
-  assert.equal(reports.filter(report => report.progress === null).length, 1);
-});
-
-test('invalid checkpoint remains recoverable and preserves browser execution', async t => {
-  const env = await setup(t, [
-    { calls: [checkpoint('invalid', [], ' '), browser('recover')] }, { calls: [finish()] },
-  ]);
-  await env.run();
-  assert.deepEqual(env.actions, ['recover']);
-  assert.equal(env.reports()[0].progress, null);
-  assert.equal(env.reports()[0].execution_status, 'completed');
-});
-
-test('checkpoint storage failure closes gate before later browser operations', async t => {
-  const env = await setup(t, [{ calls: [checkpoint('saved', ['Form opened'], 'Fill fields'), browser('after')] }], { brokenOutput: true });
-  await env.run();
-  assert.equal(env.requests(), 1);
-  assert.deepEqual(env.actions, []);
-  assert.ok(env.session.messages.some(m => m.role === 'toolResult' && m.toolName === 'qa_checkpoint' && m.isError));
-});
-
-test('checkpoint captures Browse PNG for humans, without image bytes or paths in model input/report', async t => {
-  const env = await setup(t, [
-    { calls: [{ type: 'toolCall', id: 'navigate', name: 'mcp__browse__navigate', arguments: { tab: 'chrome:7' } }] },
-    { calls: [checkpoint('capture', ['Form filled'], 'Submit the form')] },
-    { calls: [finish()] },
-  ], { screenshots: 'ok' });
-  await env.run();
-  assert.deepEqual(env.screenshotCalls, [{ tab: 'chrome:7', format: 'png' }]);
-  const [report] = env.reports();
-  assert.ok(readFileSync(join(env.dir, 'qa-diagnostics', report.run_id, 'checkpoint-001.png')).length > 0);
-  assert.equal(report.execution_status, 'completed');
-  const requestText = JSON.stringify(env.contexts);
-  assert.doesNotMatch(requestText, /iVBOR|image\/png|qa-diagnostics|checkpoint-001\.png/);
-  assert.doesNotMatch(JSON.stringify(report), /iVBOR|image\/png|qa-diagnostics|checkpoint-001\.png/);
+for (const screenshots of ['ok', 'error', 'bad-storage'] as const) test(`diagnostics ${screenshots}: one attempt, no image bytes in model/report`, async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint('S1', 'passed', ' '), checkpoint()] }, { calls: [finish()] }], { screenshots });
+  await env.run(); assert.equal(env.screenshotCalls.length, 1);
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+  assert.doesNotMatch(JSON.stringify(env.contexts), /iVBOR|image\/png|qa-diagnostics|checkpoint-001\.png/);
+  assert.doesNotMatch(JSON.stringify(env.reports()), /iVBOR|image\/png|qa-diagnostics/);
   assert.doesNotMatch(JSON.stringify(env.session.messages), /iVBOR|image\/png/);
-  assert.equal(env.requests(), 3);
+});
+
+test('current task survives compaction in short state', async t => {
+  const env = await setup(t, [{ calls: [plan(2), activate(), browser('first'), checkpoint(), activate('S2')], usageInput: 128000 }, { calls: [browser('second'), checkpoint('S2'), finish()] }], { compaction: true, compactionFixture: true });
+  await env.run(); assert.ok(env.compactions() >= 1);
+  const progress = getCurrentSystemMessage(env.contexts[1].messages)?.sections?.qa_goal_guardian_progress ?? '';
+  assert.match(progress, /Action 2/); assert.doesNotMatch(progress, /Action 1/);
+  assert.match(getCurrentSystemPrompt(env.contexts[1].messages), /Create the item exactly once/);
+  assert.equal(env.reports()[0].subtask_results.length, 2);
   assert.deepEqual(env.extensionErrors, []);
 });
 
-for (const failure of ['error', 'bad-storage'] as const) {
-  test(`diagnostic screenshot ${failure} is nonfatal and does not retry`, async t => {
-    const env = await setup(t, [
-      { calls: [{ type: 'toolCall', id: 'navigate', name: 'mcp__browse__navigate', arguments: { tab: 'chrome:7' } }] },
-      { calls: [checkpoint('capture', ['Form filled'], 'Submit the form')] },
-      { calls: [finish()] },
-    ], { screenshots: failure });
-    await env.run();
-    assert.equal(env.screenshotCalls.length, 1);
-    assert.equal(env.reports()[0].execution_status, 'completed');
-    assert.doesNotMatch(JSON.stringify(env.contexts), /iVBOR|image\/png/);
-  });
-}
+test('browser error is recoverable; rules specify rare blocked and safe recovery', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), browser('error')] }, { calls: [browser('recover'), checkpoint(), finish()] }]);
+  await env.run(); assert.deepEqual(env.actions, ['recover']);
+  assert.equal(env.reports()[0].telemetry.tool_errors, 1, JSON.stringify(env.session.messages.filter(m => m.role === 'toolResult' && m.isError)));
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+  const rules = getCurrentSystemMessage(env.contexts[0].messages)?.sections?.qa_goal_guardian_rules ?? '';
+  assert.match(rules, /safe recovery/); assert.match(rules, /Do not repeat.*side effect/);
+  assert.match(rules, /one subtask/); assert.match(rules, /three subtasks/);
+  assert.doesNotMatch(getCurrentSystemPrompt(env.contexts[0].messages), /expected_result|"expected"/);
+  assert.equal(env.contexts[1].messages.at(-1)?.role, 'toolResult');
+  assert.equal(env.contexts[1].messages.filter(m => m.role === 'user').length, 1);
+  assert.deepEqual(getCurrentTools(env.contexts[1].messages).map(t => t.name).sort(), ['browser_execute', 'qa_checkpoint', 'qa_execute_subtask', 'qa_finish', 'qa_plan']);
+});
 
-test('invalid checkpoint and finish do not trigger diagnostic screenshots', async t => {
-  const env = await setup(t, [
-    { calls: [{ type: 'toolCall', id: 'navigate', name: 'mcp__browse__navigate', arguments: { tab: 'chrome:7' } }] },
-    { calls: [checkpoint('invalid', [], ' ')] }, { calls: [finish()] },
-  ], { screenshots: 'ok' });
-  await env.run();
-  assert.equal(env.screenshotCalls.length, 0);
-  assert.equal(existsSync(join(env.dir, 'qa-diagnostics')), false);
+for (const options of [{ startupCase: true, invalidCase: true }, { startupJson: true, invalidCase: true }, { conflict: true }]) test(`invalid startup fails closed: ${JSON.stringify(options)}`, async t => {
+  const env = await setup(t, [{ calls: [browser('never')] }], options);
+  await env.run(); assert.equal(env.requests(), 0); assert.deepEqual(env.actions, []);
+});
+
+test('terminal input stays closed after invalid replacement, compaction and warming cancelled', async t => {
+  const env = await setup(t, [{ calls: success() }]); await env.run();
+  await env.session.prompt('/qa-run {broken'); await env.session.prompt('/qa-run missing-case.json');
+  await env.session.prompt('Continue'); await env.session.waitForIdle();
+  assert.equal(env.requests(), 1); assert.equal(env.reports().length, 1);
+  await assert.rejects(env.session.compact(), /cancelled/i);
+  const action = await env.session.extensionRunner.emitCacheWarmingDecision({ type: 'cache_warming_decision', action: 'warm', warmCost: 0, missCost: 1, continuationProbability: 1 });
+  assert.equal(action, 'stop');
+});
+
+test('two runs reset plan, context and counters', async t => {
+  const env = await setup(t, [{ calls: success() }, { calls: success() }]); await env.run(); await env.run();
+  assert.equal(env.reports().length, 2);
+  for (const context of env.contexts) assert.match(getCurrentSystemMessage(context.messages)?.sections?.qa_goal_guardian_progress ?? '', /planning/);
+  assert.ok(env.reports().every(r => r.telemetry.llm_calls === 1 && r.reported_verdict === 'passed'));
+});
+
+for (const [stopReason, status] of [['stop', 'incomplete'], ['error', 'error'], ['aborted', 'aborted']] as const) test(`settlement ${stopReason} remains technical ${status}`, async t => {
+  const env = await setup(t, [{ calls: [plan(), activate()] }, { stopReason, errorMessage: stopReason === 'error' ? 'Inference unavailable' : undefined }]);
+  await env.run(); assert.equal(env.reports()[0].execution_status, status); assert.equal(env.reports()[0].reported_verdict, null);
+});
+
+test('user abort then reload does not resume browser work', async t => {
+  const env = await setup(t, [{ waitForAbort: true }]);
+  const running = env.run(); await env.whenRequested; await env.session.abort(); await running;
+  assert.equal(env.reports()[0].execution_status, 'aborted');
+  await env.session.reload(); await env.session.prompt('Normal prompt'); assert.equal(env.requests(), 2);
+});
+
+test('reload unstarted case records incomplete', async t => {
+  const env = await setup(t, [], { startupCase: true }); await env.session.reload();
+  assert.equal(env.reports()[0].execution_status, 'incomplete');
+});
+
+test('Pi retry recovers without premature incomplete', async t => {
+  const env = await setup(t, [{ stopReason: 'error', errorMessage: '503 Service Unavailable' }, { calls: success() }], { retry: true });
+  await env.run(); assert.equal(env.requests(), 2); assert.equal(env.reports()[0].reported_verdict, 'passed');
+});
+
+test('storage failure closes gate before browser and further provider requests', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), browser('after')] }], { brokenOutput: true });
+  await env.run(); assert.deepEqual(env.actions, []); assert.equal(env.requests(), 1);
+  assert.ok(env.session.messages.some(m => m.role === 'toolResult' && m.toolName === 'qa_plan' && m.isError));
 });
