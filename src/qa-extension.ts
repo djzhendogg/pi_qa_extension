@@ -18,7 +18,7 @@ const QA_RULES = [
   'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
   'Use the obvious task/UI interpretation where possible; never invent required form values. blocked reason must name the obstacle, recovery and outcome, or why no safe recovery is available.',
   'Do not repeat a possibly executed side effect (submit, create, etc.) after an uncertain response. Restore observation safely. Unknown outcome is not passed; observed failure is failed. Temporary recovery is not a terminal checkpoint.',
-  'A failed/blocked checkpoint automatically stops the run after diagnostics. After all subtasks pass, call qa_finish(passed) alone using the saved observations; no additional browser work. Before any plan, qa_finish(blocked) is allowed only for an essential obstacle.',
+  'A failed/blocked checkpoint automatically stops the run after diagnostics. After all subtasks pass, call qa_finish with only {"verdict":"passed"}; do not generate reason or evidence. No additional browser work. Before any plan, qa_finish(blocked) is allowed only for an essential obstacle and requires reason.',
 ].join('\n');
 
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
@@ -267,12 +267,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: 'qa_finish', label: 'Finish QA scenario',
-    description: 'Call passed alone after every subtask passed. Final evidence is aggregated from checkpoints. Before a plan, blocked is allowed for an essential obstacle; otherwise failed/blocked must use the active subtask checkpoint.',
+    description: 'After every subtask passed, call alone with only {"verdict":"passed"}. Do not generate evidence. Omit reason for passed. Before a plan, blocked requires reason; otherwise failed/blocked must use the active subtask checkpoint.',
     executionMode: 'sequential',
     parameters: Type.Object({
       verdict: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
-      evidence: Type.String({ description: 'Nonempty for passed; final evidence comes from saved observations.' }),
-      reason: Type.String({ description: 'For emergency blocked: obstacle and recovery result or why no safe recovery exists.' }),
+      reason: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: 'Omit for passed. Required for emergency blocked: obstacle and recovery result or why no safe recovery exists.' })),
     }, { additionalProperties: false }),
     async execute(id, params, _signal, _onUpdate, ctx) {
       if (run) qaToolContext = { id, ctx };

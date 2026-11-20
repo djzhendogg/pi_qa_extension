@@ -19,7 +19,8 @@ export interface SubtaskResult {
   readonly revision: number;
   readonly source: 'agent_reported';
 }
-export interface FinishInput { verdict: Verdict; evidence: string; reason: string }
+export type FinishInput = { verdict: 'passed' } | { verdict: 'failed' | 'blocked'; reason: string };
+interface FinishResult { verdict: Verdict; evidence: string; reason: string }
 export interface ProgressSnapshot {
   readonly completed: readonly string[];
   readonly current_objective: string;
@@ -63,10 +64,9 @@ export function parseFinish(input: unknown): FinishInput {
   const value = object(input);
   if (!['passed', 'failed', 'blocked'].includes(value.verdict as string)) throw new Error('Invalid QA verdict');
   const verdict = value.verdict as Verdict;
-  if (typeof value.evidence !== 'string' || typeof value.reason !== 'string') throw new Error('evidence and reason must be strings');
-  if (verdict === 'passed') requiredString(value.evidence, 'evidence');
-  else boundedString(value.reason, 'reason', 1000);
-  return { verdict, evidence: value.evidence, reason: value.reason };
+  onlyKeys(value, verdict === 'passed' ? ['verdict'] : ['verdict', 'reason']);
+  if (verdict === 'passed') return { verdict };
+  return { verdict, reason: boundedString(value.reason, 'reason', 1000) };
 }
 
 /** One run, independent of Pi history. Validates ordering, not browser assertions. */
@@ -81,7 +81,7 @@ export class QaRun {
   private tasks: readonly Subtask[] = Object.freeze([]);
   private results: readonly SubtaskResult[] = Object.freeze([]);
   private active: string | null = null;
-  private finishInput: FinishInput | null = null;
+  private finishInput: FinishResult | null = null;
   private progress: ProgressSnapshot | null = null;
   private reason = '';
   readonly telemetry = {
@@ -187,12 +187,12 @@ export class QaRun {
   finish(input: unknown): void {
     if (this.isTerminal) return;
     const finish = parseFinish(input);
-    if (this.stage === 'planning' && finish.verdict === 'blocked') { this.complete(finish); return; }
+    if (this.stage === 'planning' && finish.verdict === 'blocked') { this.complete({ ...finish, evidence: '' }); return; }
     this.requireStage('awaiting_finish');
     if (finish.verdict !== 'passed') throw new Error('All subtasks passed; finish must use passed');
     this.complete({ verdict: 'passed', evidence: this.aggregateEvidence(), reason: '' });
   }
-  private complete(finish: FinishInput): void {
+  private complete(finish: FinishResult): void {
     this.finishInput = Object.freeze(finish);
     this.status = 'completed'; this.stage = 'terminal'; this.active = null;
     this.reason = finish.reason; this.endedAt = Date.now();

@@ -13,7 +13,7 @@ const model: Model<'openai-completions'> = {
   input: ['text'], contextWindow: 128000, maxTokens: 1024,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
-const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_finish', arguments: { verdict: 'passed', evidence: 'Success toast observed', reason: '' } });
+const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_finish', arguments: { verdict: 'passed' } });
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
@@ -473,4 +473,28 @@ test('nested model screenshot call cannot bypass checkpoint-only gate', async t 
   const result = env.session.messages.find(m => m.role === 'toolResult' && m.toolName === wrapped.name);
   assert.ok(result?.role === 'toolResult' && result.isError);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
+});
+
+test('qa_finish schema requires only verdict; passed report uses checkpoint observations', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), browser('work'), checkpoint(), finish()] }]);
+  await env.run();
+  const tool = getCurrentTools(env.contexts[0].messages).find(tool => tool.name === 'qa_finish');
+  const schema = tool?.parameters as { properties: Record<string, unknown>; required: string[] };
+  assert.deepEqual(schema.required, ['verdict']);
+  assert.equal('evidence' in schema.properties, false);
+  assert.equal(env.reports()[0].evidence, 'S1: Value visible');
+  assert.equal(env.reports()[0].reason, '');
+  const result = env.session.messages.find(m => m.role === 'toolResult' && m.toolName === 'qa_finish');
+  assert.ok(result?.role === 'toolResult' && !result.isError);
+});
+
+test('emergency blocked finish requires reason and never needs evidence', async t => {
+  const env = await setup(t, [{ calls: [
+    call('qa_finish', 'invalid-block', { verdict: 'blocked' }),
+    call('qa_finish', 'valid-block', { verdict: 'blocked', reason: 'Essential credentials missing; no safe recovery available' }),
+  ] }]);
+  await env.run();
+  assert.equal(env.reports()[0].reported_verdict, 'blocked');
+  assert.equal(env.reports()[0].evidence, '');
+  assert.match(env.reports()[0].reason, /credentials missing/);
 });

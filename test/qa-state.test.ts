@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test, type TestContext } from 'node:test';
-import { parseTestCase, QaRun } from '../src/qa-state.ts';
+import { parseTestCase, parseFinish, QaRun } from '../src/qa-state.ts';
 
 const fixture = { scenario_id: '../TC-001', url: 'https://example.com', task: 'Create item' };
 const subtasks = [{ subtask_id: 'S1', description: 'Fill and submit form' }, { subtask_id: 'S2', description: 'Check list' }];
@@ -17,7 +17,7 @@ function planned(t: TestContext) {
   return run;
 }
 const result = (subtask_id = 'S1', status = 'passed', observation = 'Selected value visible', reason = '') => ({ subtask_id, status, observation, reason });
-const finish = { verdict: 'passed', evidence: 'Untrusted final claim', reason: '' };
+const finish = { verdict: 'passed' };
 
 test('new input has scenario_id and no expected; preserves original task and rejects old schema', () => {
   for (const input of [null, {}, { id: 'old', url: fixture.url, task: 't', expected: 'x' }, { ...fixture, url: 'http' }, { ...fixture, url: 'https:example.com' }, { ...fixture, url: 'http:/example.com' }, { ...fixture, url: 'file:///x' }, { ...fixture, scenario_id: ' ' }, { ...fixture, expected: 'hidden criterion' }]) assert.throws(() => parseTestCase(input));
@@ -74,9 +74,9 @@ test('checkpoint persists before diagnostics; no next action until completion; f
   run.completeCheckpoint();
   assert.equal(run.report().stage, 'awaiting_finish');
   assert.equal(run.allowsTool('browser_execute'), false);
-  assert.throws(() => run.finish({ verdict: 'failed', evidence: '', reason: 'invented' }));
+  assert.throws(() => run.finish({ verdict: 'failed', reason: 'invented' }));
   run.finish(finish);
-  run.finish({ verdict: 'failed', evidence: '', reason: 'late' });
+  run.finish({ verdict: 'failed', reason: 'late' });
   const report = run.report();
   assert.equal(report.reported_verdict, 'passed');
   assert.equal(report.evidence, 'S1: Selected value visible\nS2: List checked');
@@ -115,8 +115,8 @@ test('invalid checkpoint does not mutate active task or revision', t => {
 test('only blocked emergency finish is available before plan', t => {
   const run = new QaRun(parseTestCase(fixture), workspace(t));
   assert.throws(() => run.finish(finish));
-  assert.throws(() => run.finish({ verdict: 'blocked', evidence: '', reason: ' ' }));
-  run.finish({ verdict: 'blocked', evidence: '', reason: 'Required credentials missing; no safe recovery available' });
+  assert.throws(() => run.finish({ verdict: 'blocked', reason: ' ' }));
+  run.finish({ verdict: 'blocked', reason: 'Required credentials missing; no safe recovery available' });
   assert.equal(run.report().reported_verdict, 'blocked');
   assert.throws(() => run.plan({ subtasks }));
 });
@@ -163,4 +163,14 @@ test('terminal state names accepted outcome and never presents pending task as c
   assert.doesNotMatch(context, /Check list/);
   assert.match(context, /blocked/);
   assert.match(context, /Required login unavailable after recovery/);
+});
+
+test('finish input requires only verdict for passed and only reason for non-passed', () => {
+  assert.deepEqual(parseFinish({ verdict: 'passed' }), { verdict: 'passed' });
+  assert.deepEqual(parseFinish({ verdict: 'blocked', reason: 'Credentials missing' }), { verdict: 'blocked', reason: 'Credentials missing' });
+  for (const input of [
+    { verdict: 'passed', reason: '' }, { verdict: 'passed', evidence: 'Extra work' },
+    { verdict: 'blocked' }, { verdict: 'blocked', reason: ' ' },
+    { verdict: 'blocked', reason: 'Obstacle', evidence: 'Extra work' },
+  ]) assert.throws(() => parseFinish(input));
 });
