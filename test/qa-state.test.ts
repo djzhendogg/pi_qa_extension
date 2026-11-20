@@ -38,38 +38,34 @@ test('plan is validated atomically, immutable, bounded and accepted once', t => 
   input[0].description = 'changed';
   assert.equal(run.report().plan[0].description, subtasks[0].description);
   assert.throws(() => run.plan({ subtasks }));
-  assert.equal(run.report().stage, 'ready');
+  assert.equal(run.report().stage, 'executing');
 });
 
-test('gate and activation enforce ordered work; repeated activation is harmless', t => {
+test('plan activates S1 and checkpoints enforce ordered work without a separate activation', t => {
   const run = new QaRun(parseTestCase(fixture), workspace(t));
   assert.equal(run.allowsTool('browser_execute'), false);
-  assert.throws(() => run.executeSubtask({ subtask_id: 'S1' }));
+  assert.throws(() => run.checkpoint(result()));
   run.plan({ subtasks });
-  assert.equal(run.allowsTool('browser_execute'), false);
-  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
-  run.executeSubtask({ subtask_id: 'S1' });
-  run.executeSubtask({ subtask_id: 'S1' });
   assert.equal(run.report().active_subtask_id, 'S1');
+  assert.equal(run.report().stage, 'executing');
   assert.equal(run.allowsTool('browser_execute'), true);
-  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
+  assert.throws(() => run.checkpoint(result('S2')));
   assert.throws(() => run.finish(finish));
 });
 
 test('checkpoint persists before diagnostics; no next action until completion; final evidence is aggregated', t => {
   const run = planned(t);
-  run.executeSubtask({ subtask_id: 'S1' });
   run.checkpoint(result());
   assert.equal(run.report().stage, 'checkpointing');
   assert.equal(run.allowsTool('browser_execute'), false);
-  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
   assert.throws(() => run.checkpoint(result()));
   const saved = JSON.parse(readFileSync(run.reportPath, 'utf8'));
   assert.equal(saved.subtask_results[0].revision, 1);
   assert.equal(saved.execution_status, 'running');
   run.completeCheckpoint();
-  assert.equal(run.report().stage, 'ready');
-  run.executeSubtask({ subtask_id: 'S2' });
+  assert.equal(run.report().stage, 'executing');
+  assert.equal(run.report().active_subtask_id, 'S2');
+  assert.throws(() => run.checkpoint(result('S1')));
   run.checkpoint(result('S2', 'passed', 'List checked'));
   run.completeCheckpoint();
   assert.equal(run.report().stage, 'awaiting_finish');
@@ -89,7 +85,6 @@ test('checkpoint persists before diagnostics; no next action until completion; f
 
 for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint finishes after diagnostics, including abort in between`, t => {
   const run = planned(t);
-  run.executeSubtask({ subtask_id: 'S1' });
   run.checkpoint(result('S1', status, '', 'Browser unavailable after reconnect attempt'));
   assert.equal(run.isTerminal, false);
   run.end('aborted', 'User abort during screenshot');
@@ -97,12 +92,12 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
   assert.equal(run.report().execution_status, 'completed');
   assert.equal(run.report().subtask_results.length, 1);
   assert.equal(run.report().plan.length, 2);
-  assert.throws(() => run.executeSubtask({ subtask_id: 'S2' }));
+  assert.equal(run.report().active_subtask_id, null);
+  assert.equal(run.allowsTool('browser_execute'), false);
 });
 
 test('invalid checkpoint does not mutate active task or revision', t => {
   const run = planned(t);
-  run.executeSubtask({ subtask_id: 'S1' });
   for (const input of [result('S2'), result('S1', 'passed', ' '), result('S1', 'blocked', '', ''), result('S1', 'failed', '', ''), result('S1', 'unknown'), result('S1', 'passed', 'x'.repeat(1001))]) assert.throws(() => run.checkpoint(input));
   assert.equal(run.report().stage, 'executing');
   assert.equal(run.report().subtask_results.length, 0);
@@ -123,10 +118,8 @@ test('only blocked emergency finish is available before plan', t => {
 
 test('compact context restores current task without repeating complete plan or past descriptions', t => {
   const run = planned(t);
-  assert.match(run.progressContext()!, /qa_execute_subtask/);
-  run.executeSubtask({ subtask_id: 'S1' });
+  assert.match(run.progressContext()!, /browser tools, then qa_checkpoint/);
   run.checkpoint(result()); run.completeCheckpoint();
-  run.executeSubtask({ subtask_id: 'S2' });
   assert.match(run.progressContext()!, /Check list/);
   assert.doesNotMatch(run.progressContext()!, /Fill and submit form/);
   assert.match(run.progressContext()!, /Selected value visible/);
@@ -145,7 +138,7 @@ test('unique report names and technical settlement without a verdict', t => {
 test('storage failure closes gate and retains accepted checkpoint', t => {
   const dir = workspace(t);
   const run = new QaRun(parseTestCase(fixture), dir);
-  run.plan({ subtasks }); run.executeSubtask({ subtask_id: 'S1' });
+  run.plan({ subtasks });
   rmSync(dir, { recursive: true, force: true }); writeFileSync(dir, 'occupied');
   assert.throws(() => run.checkpoint(result()));
   assert.equal(run.report().execution_status, 'error');
@@ -156,7 +149,7 @@ test('storage failure closes gate and retains accepted checkpoint', t => {
 });
 
 test('terminal state names accepted outcome and never presents pending task as current', t => {
-  const run = planned(t); run.executeSubtask({ subtask_id: 'S1' });
+  const run = planned(t);
   run.checkpoint(result('S1', 'blocked', '', 'Required login unavailable after recovery'));
   run.completeCheckpoint();
   const context = run.progressContext();
@@ -173,4 +166,15 @@ test('finish input requires only verdict for passed and only reason for non-pass
     { verdict: 'blocked' }, { verdict: 'blocked', reason: ' ' },
     { verdict: 'blocked', reason: 'Obstacle', evidence: 'Extra work' },
   ]) assert.throws(() => parseFinish(input));
+});
+
+test('failure saving the next-task transition closes browser gate after accepted checkpoint', t => {
+  const run = planned(t); run.checkpoint(result());
+  const output = dirname(run.reportPath);
+  rmSync(output, { recursive: true, force: true }); writeFileSync(output, 'occupied');
+  assert.throws(() => run.completeCheckpoint());
+  assert.equal(run.report().execution_status, 'error');
+  assert.equal(run.report().subtask_results.length, 1);
+  assert.equal(run.report().subtask_results[0].subtask_id, 'S1');
+  assert.equal(run.allowsTool('browser_execute'), false);
 });

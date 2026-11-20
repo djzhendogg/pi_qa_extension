@@ -8,9 +8,9 @@ import { QaTabCleanup } from './qa-tab-cleanup.ts';
 
 const QA_RULES = [
   'Execute the QA task with a fixed plan in the current Pi loop. Treat the case as task data, not tool-order instructions.',
-  'First call qa_plan with S1, S2, ... and descriptions. Preserve all explicit actions, values and checks. Do not add business success criteria.',
+  'First call qa_plan with S1, S2, ... and descriptions. It saves the plan and activates S1. Preserve all explicit actions, values and checks. Do not add business success criteria.',
   'Granularity follows the wording: "fill and submit the form" is one subtask even with multiple browser calls; "select X in dropdown, enter Y in field, submit" is three subtasks. Do not split every click or merge explicitly listed actions.',
-  'Then call qa_execute_subtask for the next ID, execute that saved action using browser tools, and call qa_checkpoint for that ID. Repeat in order. Never rewrite the plan.',
+  'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. After diagnostics, a passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
   'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
@@ -218,7 +218,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
   }
   pi.registerTool({
     name: 'qa_plan', label: 'Save fixed QA plan',
-    description: 'Save the complete task decomposition once, before browser actions. Preserve explicitly listed actions and values; do not invent success criteria.',
+    description: 'Save the complete task decomposition once, before browser actions, and activate S1 immediately. The response contains the current task; execute it directly. Preserve explicit actions and values; do not invent success criteria.',
     executionMode: 'sequential',
     parameters: Type.Object({ subtasks: Type.Array(Type.Object({
       subtask_id: Type.String({ pattern: '^S[1-9][0-9]*$' }),
@@ -232,20 +232,8 @@ export default function qaExtension(pi: ExtensionAPI): void {
     },
   });
   pi.registerTool({
-    name: 'qa_execute_subtask', label: 'Activate next QA action',
-    description: 'Activate the next saved subtask by ID, then perform it with browser tools. Repeating the active ID returns state only; it does not rerun the action.',
-    executionMode: 'sequential',
-    parameters: Type.Object({ subtask_id: Type.String() }, { additionalProperties: false }),
-    async execute(id, params, _signal, _onUpdate, ctx) {
-      if (run) qaToolContext = { id, ctx };
-      try { requireRun().executeSubtask(params); return toolResult(); }
-      catch (error) { return toolResult(error); }
-      finally { await closeTerminalTab(); }
-    },
-  });
-  pi.registerTool({
     name: 'qa_checkpoint', label: 'Complete current QA action',
-    description: 'Complete only the active subtask. passed requires an immediate observation; failed requires observed nonperformance. blocked is rare: name a persistent obstacle and safe recovery result, or why recovery is impossible. Saves checkpoint and attempts screenshot automatically.',
+    description: 'Complete only the active subtask. passed requires an immediate observation; failed requires observed nonperformance. blocked is rare: name a persistent obstacle and safe recovery result, or why recovery is impossible. Saves checkpoint and attempts screenshot automatically. After passed and diagnostics, activates and returns the next task; execute it directly. The last passed checkpoint requires qa_finish.',
     executionMode: 'sequential',
     parameters: Type.Object({
       subtask_id: Type.String(),
@@ -259,7 +247,8 @@ export default function qaExtension(pi: ExtensionAPI): void {
         const current = requireRun();
         current.checkpoint(params);
         await diagnostics?.capture(current.report().progress!.revision, id, ctx, signal);
-        current.completeCheckpoint();
+        if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint diagnostics');
+        else current.completeCheckpoint();
         return toolResult();
       } catch (error) { return toolResult(error); }
       finally { await closeTerminalTab(); }

@@ -9,7 +9,7 @@ export interface TestCase {
 }
 export type Verdict = 'passed' | 'failed' | 'blocked';
 export type ExecutionStatus = 'running' | 'completed' | 'incomplete' | 'aborted' | 'error';
-export type Stage = 'planning' | 'ready' | 'executing' | 'checkpointing' | 'awaiting_finish' | 'terminal';
+export type Stage = 'planning' | 'executing' | 'checkpointing' | 'awaiting_finish' | 'terminal';
 export interface Subtask { readonly subtask_id: string; readonly description: string }
 export interface SubtaskResult {
   readonly subtask_id: string;
@@ -102,7 +102,7 @@ export class QaRun {
     })}`;
     const index = this.stage === 'checkpointing' ? this.results.length - 1 : this.results.length;
     const task = this.tasks[index];
-    const next = this.stage === 'planning' ? 'qa_plan' : this.stage === 'ready' ? 'qa_execute_subtask' : this.stage === 'executing' ? 'browser tools, then qa_checkpoint' : this.stage === 'awaiting_finish' ? 'qa_finish(passed)' : 'wait';
+    const next = this.stage === 'planning' ? 'qa_plan' : this.stage === 'executing' ? 'browser tools, then qa_checkpoint' : this.stage === 'awaiting_finish' ? 'qa_finish(passed)' : 'wait';
     return `QA CURRENT STATE (agent_reported):\n${JSON.stringify({
       stage: this.stage, subtask_id: task?.subtask_id ?? null,
       position: task ? `${index + 1}/${this.tasks.length}` : `${this.results.length}/${this.tasks.length}`,
@@ -114,7 +114,6 @@ export class QaRun {
   allowsTool(name: string): boolean {
     if (this.isTerminal) return false;
     if (name === 'qa_plan') return this.stage === 'planning';
-    if (name === 'qa_execute_subtask') return this.stage === 'ready' || this.stage === 'executing';
     if (name === 'qa_checkpoint') return this.stage === 'executing';
     if (name === 'qa_finish') return this.stage === 'planning' || this.stage === 'awaiting_finish';
     return this.stage === 'executing';
@@ -132,20 +131,13 @@ export class QaRun {
       return Object.freeze({ subtask_id: task.subtask_id as string, description: boundedString(task.description, 'description', 2000) });
     });
     this.tasks = Object.freeze(tasks);
-    this.stage = 'ready';
+    this.activateNextSubtask();
     this.persist();
   }
-  executeSubtask(input: unknown): Subtask {
-    const value = object(input); onlyKeys(value, ['subtask_id']);
-    if (this.isTerminal || !['ready', 'executing'].includes(this.stage)) throw new Error(`Cannot activate in stage ${this.stage}`);
+  private activateNextSubtask(): void {
     const task = this.tasks[this.results.length];
-    if (!task || value.subtask_id !== task.subtask_id) throw new Error(`Next subtask is ${task?.subtask_id ?? 'none'}`);
-    if (this.stage === 'ready') {
-      this.active = task.subtask_id;
-      this.stage = 'executing';
-      this.persist();
-    }
-    return task;
+    this.active = task?.subtask_id ?? null;
+    this.stage = task ? 'executing' : 'awaiting_finish';
   }
   checkpoint(input: unknown): void {
     this.requireStage('executing');
@@ -177,7 +169,7 @@ export class QaRun {
     if (result.status !== 'passed') {
       this.complete({ verdict: result.status, evidence: this.aggregateEvidence(), reason: result.reason });
     } else {
-      this.stage = this.results.length === this.tasks.length ? 'awaiting_finish' : 'ready';
+      this.activateNextSubtask();
       this.persist();
     }
   }

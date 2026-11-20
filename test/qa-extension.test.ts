@@ -17,9 +17,8 @@ const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_f
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
-const activate = (id = 'S1') => call('qa_execute_subtask', 'activate-'+id, { subtask_id: id });
 const checkpoint = (id = 'S1', status = 'passed', observation = 'Value visible', reason = '') => call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status, observation, reason });
-const success = () => [plan(), activate(), browser('work'), checkpoint(), finish()];
+const success = () => [plan(), browser('work'), checkpoint(), finish()];
 const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
 const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
 
@@ -227,8 +226,8 @@ for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: 
   });
 }
 
-test('stage gates reject premature browser, finish and skipped activation in mixed packet', async t => {
-  const calls = [browser('before-plan'), finish('premature'), plan(2), browser('before-active'), activate('S2'), activate(), browser('first'), checkpoint(), browser('between'), activate('S2'), browser('second'), checkpoint('S2'), browser('after-tasks'), finish(), browser('after-finish')];
+test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs in a mixed packet', async t => {
+  const calls = [browser('before-plan'), finish('premature'), plan(2), checkpoint('S2'), browser('first'), checkpoint(), checkpoint('S1'), browser('second'), checkpoint('S2'), browser('after-tasks'), finish(), browser('after-finish')];
   const env = await setup(t, [{ calls }]); await env.run();
   assert.deepEqual(env.actions, ['first', 'second']);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
@@ -237,14 +236,14 @@ test('stage gates reject premature browser, finish and skipped activation in mix
 });
 
 test('invalid checkpoint stays recoverable and duplicate cannot add a revision', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), checkpoint('S1', 'passed', ' '), browser('recover'), checkpoint(), checkpoint(), finish()] }]);
+  const env = await setup(t, [{ calls: [plan(), checkpoint('S1', 'passed', ' '), browser('recover'), checkpoint(), checkpoint(), finish()] }]);
   await env.run(); assert.deepEqual(env.actions, ['recover']);
   assert.equal(env.reports()[0].subtask_results.length, 1);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
 });
 
 for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint captures once and stops later siblings`, async t => {
-  const env = await setup(t, [{ calls: [plan(2), activate(), navigate(), checkpoint('S1', status, '', 'Missing credentials; no safe recovery available'), screenshot(), activate('S2'), browser('after')] }], { screenshots: 'ok' });
+  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint('S1', status, '', 'Missing credentials; no safe recovery available'), screenshot(), browser('after')] }], { screenshots: 'ok' });
   await env.run(); assert.deepEqual(env.actions, ['navigate']);
   assert.equal(env.screenshotCalls.length, 1);
   const [report] = env.reports();
@@ -258,7 +257,7 @@ test('next subtask waits for capture; screenshot name cannot bypass gate', async
   let started!: () => void, release!: () => void;
   const captured = new Promise<void>(r => { started = r; });
   const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(2), activate(), navigate(), checkpoint(), activate('S2'), browser('second'), checkpoint('S2'), finish()] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint(), browser('second'), checkpoint('S2'), finish()] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
   const running = env.run(); await captured;
   assert.equal(env.reports()[0].stage, 'checkpointing');
   assert.equal(env.reports()[0].subtask_results.length, 1);
@@ -275,7 +274,7 @@ test('abort during failed capture preserves accepted verdict', async t => {
   let started!: () => void, release!: () => void;
   const captured = new Promise<void>(r => { started = r; });
   const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint('S1', 'failed', '', 'Value did not change'), browser('after')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'failed', '', 'Value did not change'), browser('after')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
   const running = env.run(); await captured;
   const aborting = env.session.abort(); release(); await aborting; await running;
   assert.equal(env.reports()[0].reported_verdict, 'failed');
@@ -284,7 +283,7 @@ test('abort during failed capture preserves accepted verdict', async t => {
 });
 
 for (const screenshots of ['ok', 'error', 'bad-storage'] as const) test(`diagnostics ${screenshots}: one attempt, no image bytes in model/report`, async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint('S1', 'passed', ' '), checkpoint()] }, { calls: [finish()] }], { screenshots });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'passed', ' '), checkpoint()] }, { calls: [finish()] }], { screenshots });
   await env.run(); assert.equal(env.screenshotCalls.length, 1);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
   assert.doesNotMatch(JSON.stringify(env.contexts), /iVBOR|image\/png|qa-diagnostics|checkpoint-001\.png/);
@@ -293,7 +292,7 @@ for (const screenshots of ['ok', 'error', 'bad-storage'] as const) test(`diagnos
 });
 
 test('current task survives compaction in short state', async t => {
-  const env = await setup(t, [{ calls: [plan(2), activate(), browser('first'), checkpoint(), activate('S2')], usageInput: 128000 }, { calls: [browser('second'), checkpoint('S2'), finish()] }], { compaction: true, compactionFixture: true });
+  const env = await setup(t, [{ calls: [plan(2), browser('first'), checkpoint()], usageInput: 128000 }, { calls: [browser('second'), checkpoint('S2'), finish()] }], { compaction: true, compactionFixture: true });
   await env.run(); assert.ok(env.compactions() >= 1);
   const progress = getCurrentSystemMessage(env.contexts[1].messages)?.sections?.qa_goal_guardian_progress ?? '';
   assert.match(progress, /Action 2/); assert.doesNotMatch(progress, /Action 1/);
@@ -303,7 +302,7 @@ test('current task survives compaction in short state', async t => {
 });
 
 test('browser error is recoverable; rules specify rare blocked and safe recovery', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), browser('error')] }, { calls: [browser('recover'), checkpoint(), finish()] }]);
+  const env = await setup(t, [{ calls: [plan(), browser('error')] }, { calls: [browser('recover'), checkpoint(), finish()] }]);
   await env.run(); assert.deepEqual(env.actions, ['recover']);
   assert.equal(env.reports()[0].telemetry.tool_errors, 1, JSON.stringify(env.session.messages.filter(m => m.role === 'toolResult' && m.isError)));
   assert.equal(env.reports()[0].reported_verdict, 'passed');
@@ -313,7 +312,7 @@ test('browser error is recoverable; rules specify rare blocked and safe recovery
   assert.doesNotMatch(getCurrentSystemPrompt(env.contexts[0].messages), /expected_result|"expected"/);
   assert.equal(env.contexts[1].messages.at(-1)?.role, 'toolResult');
   assert.equal(env.contexts[1].messages.filter(m => m.role === 'user').length, 1);
-  assert.deepEqual(getCurrentTools(env.contexts[1].messages).map(t => t.name).sort(), ['browser_execute', 'qa_checkpoint', 'qa_execute_subtask', 'qa_finish', 'qa_plan']);
+  assert.deepEqual(getCurrentTools(env.contexts[1].messages).map(t => t.name).sort(), ['browser_execute', 'qa_checkpoint', 'qa_finish', 'qa_plan']);
 });
 
 for (const options of [{ startupCase: true, invalidCase: true }, { startupJson: true, invalidCase: true }, { conflict: true }]) test(`invalid startup fails closed: ${JSON.stringify(options)}`, async t => {
@@ -339,7 +338,7 @@ test('two runs reset plan, context and counters', async t => {
 });
 
 for (const [stopReason, status] of [['stop', 'incomplete'], ['error', 'error'], ['aborted', 'aborted']] as const) test(`settlement ${stopReason} remains technical ${status}`, async t => {
-  const env = await setup(t, [{ calls: [plan(), activate()] }, { stopReason, errorMessage: stopReason === 'error' ? 'Inference unavailable' : undefined }]);
+  const env = await setup(t, [{ calls: [plan()] }, { stopReason, errorMessage: stopReason === 'error' ? 'Inference unavailable' : undefined }]);
   await env.run(); assert.equal(env.reports()[0].execution_status, status); assert.equal(env.reports()[0].reported_verdict, null);
 });
 
@@ -361,14 +360,14 @@ test('Pi retry recovers without premature incomplete', async t => {
 });
 
 test('storage failure closes gate before browser and further provider requests', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), browser('after')] }], { brokenOutput: true });
+  const env = await setup(t, [{ calls: [plan(), browser('after')] }], { brokenOutput: true });
   await env.run(); assert.deepEqual(env.actions, []); assert.equal(env.requests(), 1);
   assert.ok(env.session.messages.some(m => m.role === 'toolResult' && m.toolName === 'qa_plan' && m.isError));
 });
 
 const closeCall = () => call('mcp__browse__close', 'model-close', { tab: 'chrome:7' });
 for (const status of ['passed', 'failed', 'blocked'] as const) test(`automatic tab close after ${status} preserves verdict and rejects model siblings`, async t => {
-  const calls = [plan(), activate(), navigate(), checkpoint('S1', status, 'Observed result', status === 'passed' ? '' : 'Persistent obstacle after safe recovery')];
+  const calls = [plan(), navigate(), checkpoint('S1', status, 'Observed result', status === 'passed' ? '' : 'Persistent obstacle after safe recovery')];
   if (status === 'passed') calls.push(finish());
   calls.push(closeCall(), browser('after'));
   const env = await setup(t, [{ calls }], { closeTab: 'ok', screenshots: 'ok', onClose: () => {
@@ -385,7 +384,7 @@ for (const status of ['passed', 'failed', 'blocked'] as const) test(`automatic t
 });
 
 for (const [stopReason, status] of [['stop', 'incomplete'], ['error', 'error'], ['aborted', 'aborted']] as const) test(`technical ${status} closes tab from settlement`, async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate()] }, { stopReason, errorMessage: 'Technical stop' }], { closeTab: 'ok' });
+  const env = await setup(t, [{ calls: [plan(), navigate()] }, { stopReason, errorMessage: 'Technical stop' }], { closeTab: 'ok' });
   await env.run(); assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
   assert.equal(env.reports()[0].execution_status, status);
   assert.equal(env.reports()[0].reported_verdict, null);
@@ -394,7 +393,7 @@ for (const [stopReason, status] of [['stop', 'incomplete'], ['error', 'error'], 
 
 test('real user abort closes tab with an independent cleanup signal', async t => {
   let ready!: () => void; const second = new Promise<void>(resolve => { ready = resolve; });
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate()] }, { waitForAbort: true }], { closeTab: 'ok', onRequest: n => { if (n === 2) ready(); } });
+  const env = await setup(t, [{ calls: [plan(), navigate()] }, { waitForAbort: true }], { closeTab: 'ok', onRequest: n => { if (n === 2) ready(); } });
   const running = env.run(); await second; await env.session.abort(); await running;
   assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
   assert.equal(env.reports()[0].execution_status, 'aborted');
@@ -403,7 +402,7 @@ test('real user abort closes tab with an independent cleanup signal', async t =>
 test('abort during checkpoint diagnostics closes only after capture returns', async t => {
   let started!: () => void, release!: () => void;
   const captured = new Promise<void>(r => { started = r; }); const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint('S1', 'blocked', '', 'Missing access'), browser('after')] }], { closeTab: 'ok', screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'blocked', '', 'Missing access'), browser('after')] }], { closeTab: 'ok', screenshots: 'ok', captureStarted: started, captureWait: wait });
   const running = env.run(); await captured; assert.equal(env.closeCalls.length, 0);
   const aborting = env.session.abort(); release(); await aborting; await running;
   assert.deepEqual(env.lifecycle, ['screenshot', 'close']);
@@ -411,7 +410,7 @@ test('abort during checkpoint diagnostics closes only after capture returns', as
 });
 
 for (const closeTab of ['error', 'throw'] as const) test(`close ${closeTab} does not alter saved QA success or retry`, async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint(), finish()] }], { closeTab });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint(), finish()] }], { closeTab });
   await env.run(); assert.equal(env.closeCalls.length, 1);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
   const events = readFileSync(join(env.dir, 'qa-diagnostics', env.reports()[0].run_id, 'events.jsonl'), 'utf8');
@@ -419,13 +418,13 @@ for (const closeTab of ['error', 'throw'] as const) test(`close ${closeTab} does
 });
 
 test('storage error still triggers close and blocks subsequent model tools', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), browser('break-report'), checkpoint(), browser('after')] }], { closeTab: 'ok' });
+  const env = await setup(t, [{ calls: [plan(), navigate(), browser('break-report'), checkpoint(), browser('after')] }], { closeTab: 'ok' });
   await env.run(); assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
   assert.deepEqual(env.actions, ['navigate', 'break-report']); assert.equal(env.requests(), 1);
 });
 
 test('successive runs each close only their own tracked tab once', async t => {
-  const calls = () => [plan(), activate(), navigate(), checkpoint(), finish()];
+  const calls = () => [plan(), navigate(), checkpoint(), finish()];
   const env = await setup(t, [{ calls: calls() }, { calls: calls() }], { closeTab: 'ok' });
   await env.run(); await env.run(); assert.equal(env.closeCalls.length, 2);
   assert.equal(env.reports().length, 2); assert.deepEqual(env.extensionErrors, []);
@@ -433,7 +432,7 @@ test('successive runs each close only their own tracked tab once', async t => {
 
 test('graceful shutdown closes active QA tab once before settlement', async t => {
   let ready!: () => void; const second = new Promise<void>(resolve => { ready = resolve; });
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate()] }, { waitForAbort: true }], { closeTab: 'ok', onRequest: n => { if (n === 2) ready(); } });
+  const env = await setup(t, [{ calls: [plan(), navigate()] }, { waitForAbort: true }], { closeTab: 'ok', onRequest: n => { if (n === 2) ready(); } });
   const running = env.run(); await second;
   await env.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
   assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
@@ -443,7 +442,7 @@ test('graceful shutdown closes active QA tab once before settlement', async t =>
 });
 
 test('close-only Browse catalog needs no screenshot tool', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint(), finish()] }], { closeTab: 'ok' });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint(), finish()] }], { closeTab: 'ok' });
   await env.run();
   assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
   assert.equal(env.screenshotCalls.length, 0);
@@ -452,7 +451,7 @@ test('close-only Browse catalog needs no screenshot tool', async t => {
 });
 
 test('standalone screenshots are denied during active QA work; checkpoint capture still runs', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), screenshot(), browser('continue'), checkpoint(), screenshot(), finish()] }], { screenshots: 'ok' });
+  const env = await setup(t, [{ calls: [plan(), navigate(), screenshot(), browser('continue'), checkpoint(), screenshot(), finish()] }], { screenshots: 'ok' });
   await env.run();
   assert.deepEqual(env.screenshotCalls, [{ tab: 'chrome:7', format: 'png' }]);
   assert.deepEqual(env.actions, ['navigate', 'continue']);
@@ -467,7 +466,7 @@ test('standalone screenshots are denied during active QA work; checkpoint captur
 
 test('nested model screenshot call cannot bypass checkpoint-only gate', async t => {
   const wrapped = call('mcp__browse__capture_via_wrapper', 'wrapped', {});
-  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), wrapped, checkpoint(), finish()] }], { screenshots: 'ok' });
+  const env = await setup(t, [{ calls: [plan(), navigate(), wrapped, checkpoint(), finish()] }], { screenshots: 'ok' });
   await env.run();
   assert.deepEqual(env.screenshotCalls, [{ tab: 'chrome:7', format: 'png' }]);
   const result = env.session.messages.find(m => m.role === 'toolResult' && m.toolName === wrapped.name);
@@ -476,7 +475,7 @@ test('nested model screenshot call cannot bypass checkpoint-only gate', async t 
 });
 
 test('qa_finish schema requires only verdict; passed report uses checkpoint observations', async t => {
-  const env = await setup(t, [{ calls: [plan(), activate(), browser('work'), checkpoint(), finish()] }]);
+  const env = await setup(t, [{ calls: [plan(), browser('work'), checkpoint(), finish()] }]);
   await env.run();
   const tool = getCurrentTools(env.contexts[0].messages).find(tool => tool.name === 'qa_finish');
   const schema = tool?.parameters as { properties: Record<string, unknown>; required: string[] };
@@ -497,4 +496,38 @@ test('emergency blocked finish requires reason and never needs evidence', async 
   assert.equal(env.reports()[0].reported_verdict, 'blocked');
   assert.equal(env.reports()[0].evidence, '');
   assert.match(env.reports()[0].reason, /credentials missing/);
+});
+
+test('plan and checkpoints return activated tasks without qa_execute_subtask round-trips', async t => {
+  const env = await setup(t, [
+    { calls: [plan(2)] },
+    { calls: [browser('first'), checkpoint()] },
+    { calls: [browser('second'), checkpoint('S2'), finish()] },
+  ]);
+  await env.run(); assert.equal(env.requests(), 3);
+  const state = (index: number) => getCurrentSystemMessage(env.contexts[index].messages)?.sections?.qa_goal_guardian_progress ?? '';
+  assert.match(state(1), /"stage":"executing"/); assert.match(state(1), /"subtask_id":"S1"/);
+  assert.match(state(2), /"stage":"executing"/); assert.match(state(2), /"subtask_id":"S2"/);
+  assert.match(state(2), /Action 2/); assert.doesNotMatch(state(2), /Action 1/);
+  for (const context of env.contexts) assert.ok(!getCurrentTools(context.messages).some(tool => tool.name === 'qa_execute_subtask'));
+  const results = env.session.messages.filter(m => m.role === 'toolResult');
+  assert.ok(results.some(m => m.role === 'toolResult' && m.toolName === 'qa_plan' && JSON.stringify(m.content).includes('Action 1')));
+  assert.ok(results.some(m => m.role === 'toolResult' && m.toolName === 'qa_checkpoint' && JSON.stringify(m.content).includes('Action 2')));
+  assert.deepEqual(env.actions, ['first', 'second']);
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+});
+
+test('abort during passed checkpoint keeps next subtask gated', async t => {
+  let started!: () => void, release!: () => void;
+  const captured = new Promise<void>(r => { started = r; }); const wait = new Promise<void>(r => { release = r; });
+  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint(), browser('must-not-run')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait, closeTab: 'ok' });
+  const running = env.run(); await captured;
+  assert.equal(env.reports()[0].active_subtask_id, 'S1');
+  const gate = await env.session.extensionRunner.emitToolCall({ type: 'tool_call', toolName: 'browser_execute', toolCallId: 'premature', input: { action: 'S2' } });
+  assert.equal(gate?.block, true);
+  const aborting = env.session.abort(); release(); await aborting; await running;
+  assert.equal(env.reports()[0].execution_status, 'aborted');
+  assert.notEqual(env.reports()[0].active_subtask_id, 'S2');
+  assert.equal(env.reports()[0].subtask_results.length, 1);
+  assert.deepEqual(env.actions, ['navigate']); assert.equal(env.closeCalls.length, 1);
 });
