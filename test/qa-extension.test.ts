@@ -104,6 +104,14 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
         };
       },
     }));
+    if (options.screenshots) customTools.push(defineTool({
+      name: 'mcp__browse__capture_via_wrapper', label: 'Nested capture test', description: 'Fixture for nested screenshot calls',
+      parameters: Type.Object({}),
+      async execute(_id, _params, _signal, _update, ctx) {
+        const outcome = await ctx.executeTool('mcp__browse__screenshot', { tab: 'chrome:7' });
+        return { ...outcome.result, isError: outcome.isError };
+      },
+    }));
     if (options.screenshots === 'bad-storage') {
       writeFileSync(join(dir, 'qa-diagnostics'), 'not a directory');
     }
@@ -440,5 +448,29 @@ test('close-only Browse catalog needs no screenshot tool', async t => {
   assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
   assert.equal(env.screenshotCalls.length, 0);
   assert.ok(!getCurrentTools(env.contexts[0].messages).some(tool => tool.name.endsWith('screenshot')));
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+});
+
+test('standalone screenshots are denied during active QA work; checkpoint capture still runs', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), screenshot(), browser('continue'), checkpoint(), screenshot(), finish()] }], { screenshots: 'ok' });
+  await env.run();
+  assert.deepEqual(env.screenshotCalls, [{ tab: 'chrome:7', format: 'png' }]);
+  assert.deepEqual(env.actions, ['navigate', 'continue']);
+  const denied = env.session.messages.filter(m => m.role === 'toolResult' && m.toolName === 'mcp__browse__screenshot');
+  assert.equal(denied.length, 2);
+  assert.ok(denied.every(m => m.role === 'toolResult' && m.isError));
+  assert.ok(denied.every(m => m.role === 'toolResult' && JSON.stringify(m.content).includes('qa_checkpoint')));
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+  assert.equal(env.reports()[0].progress.revision, 1);
+  assert.deepEqual(env.extensionErrors, []);
+});
+
+test('nested model screenshot call cannot bypass checkpoint-only gate', async t => {
+  const wrapped = call('mcp__browse__capture_via_wrapper', 'wrapped', {});
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), wrapped, checkpoint(), finish()] }], { screenshots: 'ok' });
+  await env.run();
+  assert.deepEqual(env.screenshotCalls, [{ tab: 'chrome:7', format: 'png' }]);
+  const result = env.session.messages.find(m => m.role === 'toolResult' && m.toolName === wrapped.name);
+  assert.ok(result?.role === 'toolResult' && result.isError);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
 });

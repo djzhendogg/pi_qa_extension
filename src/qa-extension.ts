@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { parseTestCase, QaRun } from './qa-state.ts';
-import { QaDiagnostics, stripModelImages } from './qa-diagnostics.ts';
+import { QaDiagnostics, isScreenshot, stripModelImages } from './qa-diagnostics.ts';
 import { QaTabCleanup } from './qa-tab-cleanup.ts';
 
 const QA_RULES = [
@@ -11,7 +11,7 @@ const QA_RULES = [
   'First call qa_plan with S1, S2, ... and descriptions. Preserve all explicit actions, values and checks. Do not add business success criteria.',
   'Granularity follows the wording: "fill and submit the form" is one subtask even with multiple browser calls; "select X in dropdown, enter Y in field, submit" is three subtasks. Do not split every click or merge explicitly listed actions.',
   'Then call qa_execute_subtask for the next ID, execute that saved action using browser tools, and call qa_checkpoint for that ID. Repeat in order. Never rewrite the plan.',
-  'Use DOM and text observations. Screenshots are human-only diagnostics captured automatically after each accepted checkpoint; do not request them for verification.',
+  'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
@@ -184,8 +184,12 @@ export default function qaExtension(pi: ExtensionAPI): void {
       }
       return { block: true, reason: startupError ?? 'QA run is terminal. No more tool actions are allowed.', terminate: true };
     }
-    if (run && !run.allowsTool(event.toolName) &&
-        !(run.report().stage === 'checkpointing' && diagnostics?.allowsCapture(event))) {
+    const internalCapture = run?.report().stage === 'checkpointing' && diagnostics?.allowsCapture(event);
+    if (run && isScreenshot(event.toolName) && !internalCapture) {
+      run.telemetry.blocked_tool_calls++;
+      return { block: true, reason: 'Standalone screenshots are forbidden during QA. Use DOM/text observations; qa_checkpoint captures human diagnostics automatically.' };
+    }
+    if (run && !run.allowsTool(event.toolName) && !internalCapture) {
       run.telemetry.blocked_tool_calls++;
       return { block: true, reason: run.progressContext() };
     }

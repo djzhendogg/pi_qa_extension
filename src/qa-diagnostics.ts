@@ -18,7 +18,7 @@ export interface CaptureContext {
 }
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-const isScreenshot = (name: string) => /(?:^|[_:.-])screenshot$/.test(name);
+export const isScreenshot = (name: string) => /(?:^|[_:.-])screenshot$/.test(name);
 const validTab = (value: unknown): value is string | number =>
   (typeof value === 'string' && value.trim().length > 0 && value.length <= 200) || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
 
