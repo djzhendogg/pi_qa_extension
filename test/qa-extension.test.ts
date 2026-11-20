@@ -25,7 +25,7 @@ const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'c
 
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void> } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
   const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
@@ -62,17 +62,24 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   }
   const actions: string[] = [];
   const screenshotCalls: unknown[] = [];
+  const closeCalls: unknown[] = [];
+  const lifecycle: string[] = [];
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jFbkAAAAASUVORK5CYII=';
   const customTools: ToolDefinition[] = [defineTool({
     name: 'browser_execute', label: 'browser', description: 'Test browser side effect',
     parameters: Type.Object({ action: Type.String() }),
     async execute(_id, params) {
+      if (params.action === 'break-report') {
+        const output = join(dir, 'qa-results');
+        assert.equal(dirname(output), dir);
+        rmSync(output, { recursive: true, force: true }); writeFileSync(output, 'occupied');
+      }
       if (params.action === 'error') throw new Error('Browser disconnected');
       actions.push(params.action);
       return { content: [{ type: 'text', text: 'Observed page' }], details: {} };
     },
   })];
-  if (options.screenshots) {
+  if (options.screenshots || options.closeTab) {
     customTools.push(defineTool({
       name: 'mcp__browse__navigate', label: 'Navigate', description: 'Browse navigation fixture',
       parameters: Type.Object({ tab: Type.String() }),
@@ -80,11 +87,13 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
         actions.push('navigate');
         return { content: [{ type: 'text', text: JSON.stringify({ tab: params.tab }) }], details: {} };
       },
-    }), defineTool({
+    }));
+    if (options.screenshots) customTools.push(defineTool({
       name: 'mcp__browse__screenshot', label: 'Screenshot', description: 'Capture the tab as an image',
       parameters: Type.Object({ tab: Type.String(), format: Type.Optional(Type.Literal('png')) }),
       async execute(_id, params) {
         screenshotCalls.push(params);
+        lifecycle.push('screenshot');
         options.captureStarted?.();
         await options.captureWait;
         if (options.screenshots === 'error') throw new Error('Screenshot backend unavailable');
@@ -99,6 +108,16 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       writeFileSync(join(dir, 'qa-diagnostics'), 'not a directory');
     }
   }
+  if (options.closeTab) customTools.push(defineTool({
+    name: 'mcp__browse__close', label: 'Close tab', description: 'Close one Browse tab',
+    parameters: Type.Object({ tab: Type.String() }),
+    async execute(_id, params, signal) {
+      assert.equal(signal?.aborted, false);
+      closeCalls.push(params); lifecycle.push('close'); options.onClose?.();
+      if (options.closeTab === 'throw') throw new Error('Close disconnected');
+      return { content: [{ type: 'text', text: 'Tab close response' }], details: {}, isError: options.closeTab === 'error' };
+    },
+  }));
   const { session } = await createAgentSession({
     cwd: dir, agentDir: join(dir, 'agent'), model, resourceLoader: loader,
     sessionManager: SessionManager.inMemory(dir), settingsManager: settings,
@@ -118,6 +137,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       const reply = aborted ? { stopReason: 'aborted' as const } : replies[requests];
       if (!aborted) {
         requests++;
+        options.onRequest?.(requests);
         contexts.push(structuredClone(context));
         await streamOptions?.onPayload?.({ test_request: requests }, model);
         started();
@@ -159,7 +179,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
     rmSync(dir, { recursive: true, force: true });
   });
   return {
-    session, dir, actions, contexts, extensionErrors, whenRequested, screenshotCalls,
+    session, dir, actions, contexts, extensionErrors, whenRequested, screenshotCalls, closeCalls, lifecycle,
     requests: () => requests,
     compactions: () => compactions,
     async run() {
@@ -336,4 +356,89 @@ test('storage failure closes gate before browser and further provider requests',
   const env = await setup(t, [{ calls: [plan(), activate(), browser('after')] }], { brokenOutput: true });
   await env.run(); assert.deepEqual(env.actions, []); assert.equal(env.requests(), 1);
   assert.ok(env.session.messages.some(m => m.role === 'toolResult' && m.toolName === 'qa_plan' && m.isError));
+});
+
+const closeCall = () => call('mcp__browse__close', 'model-close', { tab: 'chrome:7' });
+for (const status of ['passed', 'failed', 'blocked'] as const) test(`automatic tab close after ${status} preserves verdict and rejects model siblings`, async t => {
+  const calls = [plan(), activate(), navigate(), checkpoint('S1', status, 'Observed result', status === 'passed' ? '' : 'Persistent obstacle after safe recovery')];
+  if (status === 'passed') calls.push(finish());
+  calls.push(closeCall(), browser('after'));
+  const env = await setup(t, [{ calls }], { closeTab: 'ok', screenshots: 'ok', onClose: () => {
+    assert.equal(env.reports()[0].execution_status, 'completed');
+    assert.ok(existsSync(join(env.dir, 'qa-diagnostics', env.reports()[0].run_id, 'checkpoint-001.png')));
+  } });
+  await env.run();
+  assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
+  assert.deepEqual(env.lifecycle, ['screenshot', 'close']);
+  assert.deepEqual(env.actions, ['navigate']);
+  assert.equal(env.reports()[0].reported_verdict, status);
+  assert.equal(env.requests(), 1);
+  assert.deepEqual(env.extensionErrors, []);
+});
+
+for (const [stopReason, status] of [['stop', 'incomplete'], ['error', 'error'], ['aborted', 'aborted']] as const) test(`technical ${status} closes tab from settlement`, async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate()] }, { stopReason, errorMessage: 'Technical stop' }], { closeTab: 'ok' });
+  await env.run(); assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
+  assert.equal(env.reports()[0].execution_status, status);
+  assert.equal(env.reports()[0].reported_verdict, null);
+  assert.equal(env.screenshotCalls.length, 0);
+});
+
+test('real user abort closes tab with an independent cleanup signal', async t => {
+  let ready!: () => void; const second = new Promise<void>(resolve => { ready = resolve; });
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate()] }, { waitForAbort: true }], { closeTab: 'ok', onRequest: n => { if (n === 2) ready(); } });
+  const running = env.run(); await second; await env.session.abort(); await running;
+  assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
+  assert.equal(env.reports()[0].execution_status, 'aborted');
+});
+
+test('abort during checkpoint diagnostics closes only after capture returns', async t => {
+  let started!: () => void, release!: () => void;
+  const captured = new Promise<void>(r => { started = r; }); const wait = new Promise<void>(r => { release = r; });
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint('S1', 'blocked', '', 'Missing access'), browser('after')] }], { closeTab: 'ok', screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const running = env.run(); await captured; assert.equal(env.closeCalls.length, 0);
+  const aborting = env.session.abort(); release(); await aborting; await running;
+  assert.deepEqual(env.lifecycle, ['screenshot', 'close']);
+  assert.equal(env.reports()[0].reported_verdict, 'blocked');
+});
+
+for (const closeTab of ['error', 'throw'] as const) test(`close ${closeTab} does not alter saved QA success or retry`, async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint(), finish()] }], { closeTab });
+  await env.run(); assert.equal(env.closeCalls.length, 1);
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
+  const events = readFileSync(join(env.dir, 'qa-diagnostics', env.reports()[0].run_id, 'events.jsonl'), 'utf8');
+  assert.match(events, /tab_close_failed/); assert.equal(env.requests(), 1);
+});
+
+test('storage error still triggers close and blocks subsequent model tools', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), browser('break-report'), checkpoint(), browser('after')] }], { closeTab: 'ok' });
+  await env.run(); assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
+  assert.deepEqual(env.actions, ['navigate', 'break-report']); assert.equal(env.requests(), 1);
+});
+
+test('successive runs each close only their own tracked tab once', async t => {
+  const calls = () => [plan(), activate(), navigate(), checkpoint(), finish()];
+  const env = await setup(t, [{ calls: calls() }, { calls: calls() }], { closeTab: 'ok' });
+  await env.run(); await env.run(); assert.equal(env.closeCalls.length, 2);
+  assert.equal(env.reports().length, 2); assert.deepEqual(env.extensionErrors, []);
+});
+
+test('graceful shutdown closes active QA tab once before settlement', async t => {
+  let ready!: () => void; const second = new Promise<void>(resolve => { ready = resolve; });
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate()] }, { waitForAbort: true }], { closeTab: 'ok', onRequest: n => { if (n === 2) ready(); } });
+  const running = env.run(); await second;
+  await env.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+  assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
+  await env.session.abort(); await running;
+  assert.equal(env.closeCalls.length, 1);
+  assert.equal(env.reports()[0].execution_status, 'incomplete');
+});
+
+test('close-only Browse catalog needs no screenshot tool', async t => {
+  const env = await setup(t, [{ calls: [plan(), activate(), navigate(), checkpoint(), finish()] }], { closeTab: 'ok' });
+  await env.run();
+  assert.deepEqual(env.closeCalls, [{ tab: 'chrome:7' }]);
+  assert.equal(env.screenshotCalls.length, 0);
+  assert.ok(!getCurrentTools(env.contexts[0].messages).some(tool => tool.name.endsWith('screenshot')));
+  assert.equal(env.reports()[0].reported_verdict, 'passed');
 });

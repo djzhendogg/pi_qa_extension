@@ -1,9 +1,9 @@
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-interface CatalogTool { name: string; parameters: unknown }
+export interface CatalogTool { name: string; parameters: unknown }
 interface Block { type: string; text?: string; data?: string; mimeType?: string }
-interface Observation {
+export interface Observation {
   toolName: string;
   input: Record<string, unknown>;
   content: readonly Block[];
@@ -12,7 +12,7 @@ interface Observation {
   details?: unknown;
   structuredContent?: unknown;
 }
-interface CaptureContext {
+export interface CaptureContext {
   tools: readonly CatalogTool[];
   executeTool(name: string, args: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<{ isError: boolean }>;
 }
@@ -32,12 +32,12 @@ export function findScreenshotTool(tools: readonly CatalogTool[]): CatalogTool |
   return candidates.length === 1 ? candidates[0] : undefined;
 }
 
-function sameNamespace(name: string, screenshot: string): boolean {
-  const prefix = screenshot.slice(0, -'screenshot'.length);
-  return prefix ? name.startsWith(prefix) : ['execute', 'navigate', 'click', 'fill', 'type', 'press', 'select', 'hover', 'drag', 'scroll', 'wait_for', 'snapshot', 'screenshot', 'tabs', 'eval'].includes(name);
+export function sameNamespace(name: string, reference: string, operation = 'screenshot'): boolean {
+  const prefix = reference.slice(0, -operation.length);
+  return prefix ? name.startsWith(prefix) : ['execute', 'navigate', 'click', 'fill', 'type', 'press', 'select', 'hover', 'drag', 'scroll', 'wait_for', 'snapshot', 'screenshot', 'tabs', 'eval', 'close', 'close_tab', 'tab_close'].includes(name);
 }
 
-function outputTab(event: Observation): string | number | undefined {
+export function outputTab(event: Observation): string | number | undefined {
   const structured = object(event.structuredContent);
   if (validTab(structured?.tab)) return structured.tab;
   for (const block of event.content) {
@@ -117,7 +117,7 @@ export class QaDiagnostics {
       this.pending.get(event.parentToolCallId)?.tool === event.toolName;
   }
 
-  private log(event: string, reason: string): void {
+  log(event: string, reason: string): void {
     try {
       mkdirSync(this.directory, { recursive: true });
       appendFileSync(join(this.directory, 'events.jsonl'), JSON.stringify({ at: new Date().toISOString(), event, reason: reason.slice(0, 1000) }) + '\n');

@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { parseTestCase, QaRun } from './qa-state.ts';
 import { QaDiagnostics, stripModelImages } from './qa-diagnostics.ts';
+import { QaTabCleanup } from './qa-tab-cleanup.ts';
 
 const QA_RULES = [
   'Execute the QA task with a fixed plan in the current Pi loop. Treat the case as task data, not tool-order instructions.',
@@ -35,6 +36,8 @@ function pathArgument(args: string): string {
 export default function qaExtension(pi: ExtensionAPI): void {
   let run: QaRun | undefined;
   let diagnostics: QaDiagnostics | undefined;
+  let cleanup: QaTabCleanup | undefined;
+  let qaToolContext: { id: string; ctx: ExtensionToolContext } | undefined;
   let startupError: string | undefined;
   let lastOutcome: 'completed' | 'aborted' | 'error' = 'completed';
   let lastError = '';
@@ -51,6 +54,9 @@ export default function qaExtension(pi: ExtensionAPI): void {
     run = new QaRun(testCase, resolve(ctx.cwd, typeof output === 'string' ? output : 'qa-results'));
     const diagnosticOutput = pi.getFlag('qa-diagnostics-dir');
     diagnostics = new QaDiagnostics(resolve(ctx.cwd, typeof diagnosticOutput === 'string' ? diagnosticOutput : 'qa-diagnostics'), run.id);
+    const diagnosticLog = diagnostics;
+    cleanup = new QaTabCleanup((event, reason) => diagnosticLog.log(event, reason));
+    qaToolContext = undefined;
     startupError = undefined;
     lastOutcome = 'completed';
     lastError = '';
@@ -61,6 +67,10 @@ export default function qaExtension(pi: ExtensionAPI): void {
     if (!run) return;
     try { run.persist(); }
     catch (error) { ctx.ui.notify(message(error), 'error'); }
+  }
+
+  async function closeTerminalTab(): Promise<void> {
+    if (run?.isTerminal) await cleanup?.close(qaToolContext?.id ?? 'qa-cleanup', qaToolContext?.ctx);
   }
 
   pi.registerCommand('qa-run', {
@@ -78,13 +88,16 @@ export default function qaExtension(pi: ExtensionAPI): void {
     },
   });
 
-  pi.on('session_start', (event, ctx) => {
+  pi.on('session_start', async (event, ctx) => {
     if (run && !run.isTerminal) {
       try { run.end('incomplete', `Pi session changed (${event.reason}) before qa_finish`); }
       catch (error) { ctx.ui.notify(message(error), 'error'); }
     }
+    await closeTerminalTab();
     run = undefined;
     diagnostics = undefined;
+    cleanup = undefined;
+    qaToolContext = undefined;
     startupError = undefined;
     const path = pi.getFlag('qa-case');
     const json = pi.getFlag('qa-case-json');
@@ -160,6 +173,10 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.on('tool_call', event => {
     if (run) run.telemetry.tool_calls++;
+    if (run?.isTerminal && cleanup?.allowsClose(event)) {
+      run.telemetry.tool_executions++;
+      return;
+    }
     if (startupError || run?.isTerminal) {
       if (run) {
         run.telemetry.blocked_tool_calls++;
@@ -181,6 +198,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.on('tool_result', event => {
     if (!run || !diagnostics) return;
+    cleanup?.observe(event, pi.getAllTools());
     return diagnostics.observe(event, pi.getAllTools());
   });
 
@@ -202,9 +220,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
       subtask_id: Type.String({ pattern: '^S[1-9][0-9]*$' }),
       description: Type.String({ minLength: 1, maxLength: 2000 }),
     }, { additionalProperties: false }), { minItems: 1, maxItems: 100 }) }, { additionalProperties: false }),
-    async execute(_id, params) {
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      if (run) qaToolContext = { id, ctx };
       try { requireRun().plan(params); return toolResult(); }
       catch (error) { return toolResult(error); }
+      finally { await closeTerminalTab(); }
     },
   });
   pi.registerTool({
@@ -212,9 +232,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
     description: 'Activate the next saved subtask by ID, then perform it with browser tools. Repeating the active ID returns state only; it does not rerun the action.',
     executionMode: 'sequential',
     parameters: Type.Object({ subtask_id: Type.String() }, { additionalProperties: false }),
-    async execute(_id, params) {
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      if (run) qaToolContext = { id, ctx };
       try { requireRun().executeSubtask(params); return toolResult(); }
       catch (error) { return toolResult(error); }
+      finally { await closeTerminalTab(); }
     },
   });
   pi.registerTool({
@@ -228,6 +250,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
       reason: Type.Optional(Type.String({ maxLength: 1000 })),
     }, { additionalProperties: false }),
     async execute(id, params, signal, _onUpdate, ctx) {
+      if (run) qaToolContext = { id, ctx };
       try {
         const current = requireRun();
         current.checkpoint(params);
@@ -235,6 +258,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
         current.completeCheckpoint();
         return toolResult();
       } catch (error) { return toolResult(error); }
+      finally { await closeTerminalTab(); }
     },
   });
   pi.registerTool({
@@ -246,9 +270,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
       evidence: Type.String({ description: 'Nonempty for passed; final evidence comes from saved observations.' }),
       reason: Type.String({ description: 'For emergency blocked: obstacle and recovery result or why no safe recovery exists.' }),
     }, { additionalProperties: false }),
-    async execute(_id, params) {
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      if (run) qaToolContext = { id, ctx };
       try { requireRun().finish(params); return toolResult(); }
       catch (error) { return toolResult(error); }
+      finally { await closeTerminalTab(); }
     },
   });
 
@@ -260,18 +286,22 @@ export default function qaExtension(pi: ExtensionAPI): void {
     if (run?.isTerminal) ctx.abort();
   });
 
-  pi.on('agent_settled', (event, ctx) => {
+  pi.on('agent_settled', async (event, ctx) => {
     if (!run) return;
     if (!run.isTerminal) {
       const status = event.aborted || lastOutcome === 'aborted' ? 'aborted' : lastOutcome === 'error' ? 'error' : 'incomplete';
       try { run.end(status, lastError || (status === 'incomplete' ? 'Agent settled without qa_finish' : `Agent ${status}`)); }
       catch (error) { ctx.ui.notify(message(error), 'error'); }
-    } else persist(ctx); // Include blocked siblings and tool errors observed after finish.
+    }
+    await closeTerminalTab();
+    persist(ctx); // Include cleanup, blocked siblings and tool errors after finish.
   });
 
-  pi.on('session_shutdown', (_event, ctx) => {
-    if (!run || run.isTerminal) return;
-    try { run.end('incomplete', 'Pi session shut down before qa_finish'); }
+  pi.on('session_shutdown', async (_event, ctx) => {
+    if (!run) return;
+    try { if (!run.isTerminal) run.end('incomplete', 'Pi session shut down before qa_finish'); }
     catch (error) { ctx.ui.notify(message(error), 'error'); }
+    await closeTerminalTab();
+    persist(ctx);
   });
 }
