@@ -127,8 +127,13 @@ export class QaDiagnostics {
   observe(event: Observation, tools: readonly CatalogTool[]) {
     const screenshot = findScreenshotTool(tools);
     if (!event.isError && screenshot && sameNamespace(event.toolName, screenshot.name)) {
-      const tab = outputTab(event);
-      if (tab !== undefined) this.target = { tool: screenshot.name, tab };
+      const action = /(?:^|[_:.-])tabs$/.test(event.toolName) ? event.input.action ?? 'list' : undefined;
+      if (action === 'close') {
+        if (event.input.tab === this.target?.tab) this.target = undefined;
+      } else if (action === undefined || action === 'new') {
+        const tab = outputTab(event);
+        if (tab !== undefined) this.target = { tool: screenshot.name, tab };
+      }
     }
     const images = event.content.filter(block => block.type === 'image');
     const capture = event.parentToolCallId ? this.pending.get(event.parentToolCallId) : undefined;

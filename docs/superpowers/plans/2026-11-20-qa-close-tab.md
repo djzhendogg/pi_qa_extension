@@ -10,6 +10,8 @@
 
 **Spec:** User approved automatic close after any passed/failed/blocked or technical incomplete/error/abort. Final checkpoint screenshot precedes closure. Hard process kill cannot run cleanup.
 
+> Исправление контракта Browse: первоначальный поиск close/close_tab/tab_close оказался несовместим с реальным MCP. Текущая реализация использует tabs({action: "close", tab}) по rust/crates/browse-relay/src/tools.rs. Общая схема tabs имеет required: []; tab обязателен при выполнении close. Указания ниже о plain close-tool заменены этим контрактом.
+
 ## Global Constraints
 
 - Do not close arbitrary tabs or the browser; no tab enumeration or broad session cleanup.
@@ -51,3 +53,9 @@
 - Task 2 complete: real Pi tests RED→GREEN for terminal verdicts, technical settlement, user abort, checkpoint abort, shutdown, report storage error and repeated runs.
 - Final review: read-only reviewer identified close response tab metadata ambiguity. Fixed using requested input.tab; both own-tab/foreign-tab regressions observed RED→GREEN. Added real Pi close-only catalog coverage to resolve test gap.
 - External validation limits: live Browse schemas and backends that ignore abort signals remain target checks. No commit/push in this implementation request.
+
+- Bugfix: cleanup unit and Pi integration fixtures migrated from invented plain close tool to the real tabs action schema. Tests observed RED before production fix, then GREEN; authorization checks exact action+tab and rejects other tab operations. tabs new can establish the target; tabs list never selects a QA tab.
+
+- Review regression fixed: tabs(list/default) is ignored by both screenshot and cleanup target tracking; otherwise a diagnostic screenshot could indirectly select a foreign cleanup tab. Three diagnostic regression tests observed RED→GREEN, plus a real Pi list→checkpoint→finish test verifies both calls retain the QA tab. Live Browse proxy execution remains unverified.
+
+- Final validation of tabs contract fix: full suite 85/85 with node --import tsx --test --test-concurrency=1 test/*.test.ts; typecheck green. Default concurrent-file runs hit the pre-existing Windows EPERM atomic-report-rename issue (including qa_finish in the recovery test); no storage behavior changed in this fix.

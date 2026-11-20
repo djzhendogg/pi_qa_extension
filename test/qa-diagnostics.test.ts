@@ -100,3 +100,21 @@ test('legacy string-content messages drop embedded data-image URIs before summar
   assert.match(filtered[0].content, /Continue with the form/);
   assert.match(original[0].content, /data:image/);
 });
+
+for (const action of [undefined, 'list']) test(`tabs list (${action ?? 'default'}) cannot reroute checkpoint screenshot`, async t => {
+  const { diagnostics } = setup(t);
+  diagnostics.observe({ toolName: 'mcp__browse__navigate', input: { tab: 'qa' }, content: [], isError: false }, tools);
+  diagnostics.observe({ toolName: 'mcp__browse__tabs', input: { tab: 'foreign', ...(action ? { action } : {}) }, content: [{ type: 'text', text: '{"tab":"foreign"}' }], isError: false }, tools);
+  const calls: unknown[] = [];
+  await diagnostics.capture(1, 'checkpoint', { tools, async executeTool(_name, args) { calls.push(args); return { isError: false }; } });
+  assert.deepEqual(calls, [{ tab: 'qa', format: 'png' }]);
+});
+
+test('tabs close invalidates its screenshot target instead of selecting a returned tab', async t => {
+  const { diagnostics } = setup(t);
+  diagnostics.observe({ toolName: 'mcp__browse__navigate', input: { tab: 'qa' }, content: [], isError: false }, tools);
+  diagnostics.observe({ toolName: 'mcp__browse__tabs', input: { action: 'close', tab: 'qa' }, content: [{ type: 'text', text: '{"tab":"foreign"}' }], isError: false }, tools);
+  let calls = 0;
+  await diagnostics.capture(1, 'checkpoint', { tools, async executeTool() { calls++; return { isError: false }; } });
+  assert.equal(calls, 0);
+});
