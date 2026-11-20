@@ -229,6 +229,22 @@ for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: 
   });
 }
 
+test('QA requests replace Pi coding instructions and retain case, progress, and tools', async t => {
+  const env = await setup(t, [{}, { calls: [plan()] }, { calls: [browser('work'), checkpoint(), finish()] }]);
+  await env.session.prompt('Ordinary Pi request');
+  await env.run();
+
+  assert.match(getCurrentSystemPrompt(env.contexts[0].messages), /coding assistant running inside pi/);
+  for (const context of env.contexts.slice(1)) {
+    const prompt = getCurrentSystemPrompt(context.messages);
+    assert.doesNotMatch(prompt, /coding assistant running inside pi|<tools>|<rules>|<docs>/);
+    assert.match(prompt, /Create the item exactly once/);
+    assert.match(prompt, /First call qa_plan/);
+    assert.ok(getCurrentTools(context.messages).some(tool => tool.name === 'browser_execute'));
+  }
+  assert.match(getCurrentSystemPrompt(env.contexts[2].messages), /"subtask_id":"S1"/);
+});
+
 test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs in a mixed packet', async t => {
   const calls = [browser('before-plan'), finish('premature'), plan(2), checkpoint('S2'), browser('first'), checkpoint(), checkpoint('S1'), browser('second'), checkpoint('S2'), browser('after-tasks'), finish(), browser('after-finish')];
   const env = await setup(t, [{ calls }]); await env.run();

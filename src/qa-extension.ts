@@ -123,6 +123,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     if (run && !run.isTerminal) {
       // Use Pi's structured prompt sections. Returning a forced systemPrompt makes
       // Pi re-project it after context hooks and would erase dynamic progress.
+      event.systemPromptOptions.customPrompt ??= 'You are a browser QA agent. Execute the loaded test case using the QA workflow below.';
       event.systemPromptOptions.sections.qa_goal_guardian_rules = QA_RULES;
       event.systemPromptOptions.sections.qa_goal_guardian_case = run.caseContext();
     }
