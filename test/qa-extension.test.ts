@@ -27,8 +27,9 @@ const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:
 const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
 
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
+type ConfidenceReply = string | { text: string; stopReason: 'error' | 'length' };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext) => string | Promise<string>; browseEvidence?: boolean } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext, options?: SimpleStreamOptions) => ConfidenceReply | Promise<ConfidenceReply>; browseEvidence?: boolean } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
   const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
@@ -181,9 +182,12 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       const confidence = getCurrentSystemPrompt(context.messages).startsWith('Assess the confidence');
       const reply = aborted ? { stopReason: 'aborted' as const } : confidence ? undefined : replies[requests];
       let text = 'Done';
+      let confidenceStop: 'error' | 'length' | undefined;
       if (confidence) {
         confidenceContexts.push(structuredClone(context));
-        text = await options.assessConfidence?.(context) ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value."}';
+        const answer = await options.assessConfidence?.(context, streamOptions) ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value."}';
+        text = typeof answer === 'string' ? answer : answer.text;
+        confidenceStop = typeof answer === 'string' ? undefined : answer.stopReason;
       } else if (!aborted) {
         requests++;
         options.onRequest?.(requests);
@@ -194,7 +198,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       if (reply?.waitForAbort && !streamOptions?.signal?.aborted) {
         await new Promise<void>(resolve => streamOptions?.signal?.addEventListener('abort', () => resolve(), { once: true }));
       }
-      const stopReason = streamOptions?.signal?.aborted ? 'aborted' : reply?.stopReason ?? (reply?.calls?.length ? 'toolUse' : 'stop');
+      const stopReason = streamOptions?.signal?.aborted ? 'aborted' : confidenceStop ?? reply?.stopReason ?? (reply?.calls?.length ? 'toolUse' : 'stop');
       const message: AssistantMessage = {
         role: 'assistant', content: reply?.calls ?? [{ type: 'text', text }],
         api: model.api, provider: model.provider, model: model.id, stopReason,
@@ -371,11 +375,39 @@ test('confidence receives the step Browse trace and only fresh DOM observations'
   assert.equal(third.dom_after, null);
 });
 
-test('an invalid confidence response leaves the QA verdict intact', async t => {
+for (const [failure, firstAnswer] of [
+  ['provider error', { text: '', stopReason: 'error' }],
+  ['truncated answer', { text: '{"confidence_score":', stopReason: 'length' }],
+  ['invalid JSON', '{"confidence_score":'],
+] as const) test(`confidence retries once after ${failure} with thinking off and 2048 tokens`, async t => {
+  const attempts: Array<SimpleStreamOptions | undefined> = [];
+  const env = await setup(t, [{ calls: success() }], {
+    assessConfidence(_context, options) {
+      attempts.push(options);
+      return attempts.length === 1 ? firstAnswer : '{"confidence_score":96,"reasoning":"The page confirms success."}';
+    },
+  });
+  await env.run();
+  const [report] = env.reports();
+  assert.equal(report.subtask_results[0].confidence_score, 96);
+  assert.equal(report.subtask_results[0].confidence_status, 'completed');
+  assert.equal(report.telemetry.confidence_llm_calls, 2);
+  assert.equal(env.requests(), 1);
+  assert.equal(attempts.length, 2);
+  for (const options of attempts) {
+    assert.equal(options?.maxTokens, 2048);
+    assert.equal(options?.reasoning, undefined);
+    assert.equal(options?.maxRetries, 0);
+  }
+  assert.notEqual(attempts[0]?.signal, attempts[1]?.signal);
+});
+
+test('two invalid confidence responses leave the QA verdict intact', async t => {
   const env = await setup(t, [{ calls: success() }], { assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}' });
   await env.run();
   const [report] = env.reports();
   assert.equal(report.reported_verdict, 'passed');
+  assert.equal(report.telemetry.confidence_llm_calls, 2);
   const [step] = report.subtask_results;
   assert.equal(step.confidence_status, 'failed');
   assert.equal(step.confidence_score, null);

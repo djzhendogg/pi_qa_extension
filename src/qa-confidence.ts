@@ -35,18 +35,30 @@ export class QaConfidence {
     const { model, modelRegistry } = ctx;
     this.tail = this.tail.then(async () => {
       let estimate: ConfidenceEstimate | undefined;
-      try {
-        if (!model) throw new Error('No active Pi model for the confidence request');
-        run.telemetry.confidence_llm_calls++;
-        const response = await modelRegistry.streamSimple(model, {
-          systemPrompt: prompt,
-          messages: [{ role: 'user', content: JSON.stringify(evidence), timestamp: Date.now() }],
-        }, { maxTokens: 512, signal: AbortSignal.timeout(15_000) }).result();
-        if (response.stopReason !== 'stop') throw new Error(`Confidence request ended with ${response.stopReason}`);
-        const text = response.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n');
-        estimate = parseEstimate(text);
-      } catch (error) {
-        this.log('confidence_failed', error instanceof SyntaxError ? 'Invalid confidence JSON' : String(error));
+      if (!model) {
+        this.log('confidence_failed', 'No active Pi model for the confidence request');
+      } else {
+        const messages = [{ role: 'user' as const, content: JSON.stringify(evidence), timestamp: Date.now() }];
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            run.telemetry.confidence_llm_calls++;
+            const response = await modelRegistry.streamSimple(model, {
+              systemPrompt: attempt === 1 ? prompt : `${prompt}\nReturn a complete JSON object without Markdown or surrounding text.`,
+              messages,
+            }, {
+              reasoning: undefined, // Pi represents thinking off by omitting reasoning.
+              maxTokens: 2048,
+              maxRetries: 0, // This queue owns the retry, including validation failures.
+              signal: AbortSignal.timeout(15_000),
+            }).result();
+            if (response.stopReason !== 'stop') throw new Error(`Confidence request ended with ${response.stopReason}`);
+            const text = response.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n');
+            estimate = parseEstimate(text);
+            break;
+          } catch (error) {
+            this.log(attempt === 1 ? 'confidence_retry' : 'confidence_failed', error instanceof SyntaxError ? 'Invalid confidence JSON' : String(error));
+          }
+        }
       }
       try { run.recordConfidence(revision, estimate); }
       catch (error) { this.log('confidence_save_failed', String(error)); }
