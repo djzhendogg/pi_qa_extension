@@ -6,6 +6,7 @@ import { parseTestCase, QaRun } from './qa-state.ts';
 import { QaDiagnostics, isScreenshot, stripModelImages } from './qa-diagnostics.ts';
 import { QaTabCleanup } from './qa-tab-cleanup.ts';
 import { QaConfidence } from './qa-confidence.ts';
+import { QaBrowseTrace } from './qa-browse-trace.ts';
 
 const QA_RULES = [
   'Execute the QA task with a fixed plan in the current Pi loop. Treat the case as task data, not tool-order instructions.',
@@ -14,6 +15,7 @@ const QA_RULES = [
   'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. A passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
   'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
+  'When you already read DOM inside Browse execute, return the snapshot in dom_before or dom_after as appropriate. Keep the observed result in the same call. Do not add a browser call just for the confidence assessment.',
   'For each qa_checkpoint, report the observed page URLs immediately before and after the active action. Use the same URL in both fields if it stayed unchanged, and null for any URL you could not observe.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
@@ -39,6 +41,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
   let run: QaRun | undefined;
   let diagnostics: QaDiagnostics | undefined;
   let confidence: QaConfidence | undefined;
+  let browseTrace: QaBrowseTrace | undefined;
   let cleanup: QaTabCleanup | undefined;
   let qaToolContext: { id: string; ctx: ExtensionToolContext } | undefined;
   let startupError: string | undefined;
@@ -61,6 +64,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     const log = (event: string, reason: string) => diagnosticLog.log(event, reason);
     cleanup = new QaTabCleanup(log);
     confidence = new QaConfidence(log);
+    browseTrace = new QaBrowseTrace();
     qaToolContext = undefined;
     startupError = undefined;
     lastOutcome = 'completed';
@@ -105,6 +109,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     run = undefined;
     diagnostics = undefined;
     confidence = undefined;
+    browseTrace = undefined;
     cleanup = undefined;
     qaToolContext = undefined;
     startupError = undefined;
@@ -202,7 +207,10 @@ export default function qaExtension(pi: ExtensionAPI): void {
       run.telemetry.blocked_tool_calls++;
       return { block: true, reason: run.progressContext() };
     }
-    if (run) run.telemetry.tool_executions++;
+    if (run) {
+      run.telemetry.tool_executions++;
+      browseTrace?.begin(event, pi.getAllTools());
+    }
   });
 
   pi.on('tool_execution_end', event => {
@@ -211,8 +219,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.on('tool_result', event => {
     if (!run || !diagnostics) return;
-    if (!isScreenshot(event.toolName)) cleanup?.observe(event, pi.getAllTools());
-    return diagnostics.observe(event, pi.getAllTools());
+    const tools = pi.getAllTools();
+    if (!isScreenshot(event.toolName)) cleanup?.observe(event, tools);
+    const filtered = diagnostics.observe(event, tools);
+    browseTrace?.observe(filtered ? { ...event, content: filtered.content } : event);
+    return filtered;
   });
 
   function toolResult(error?: unknown) {
@@ -256,7 +267,8 @@ export default function qaExtension(pi: ExtensionAPI): void {
       try {
         const current = requireRun();
         const { revision, evidence } = current.checkpoint(params);
-        confidence?.enqueue(current, revision, evidence, ctx);
+        const browserEvidence = browseTrace!.finish(evidence.url_before, evidence.url_after);
+        confidence?.enqueue(current, revision, { ...evidence, ...browserEvidence }, ctx);
         if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint');
         else {
           void diagnostics?.capture(revision, id, ctx);

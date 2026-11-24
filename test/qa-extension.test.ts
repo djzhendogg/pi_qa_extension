@@ -28,7 +28,7 @@ const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'c
 
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext) => string | Promise<string> } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext) => string | Promise<string>; browseEvidence?: boolean } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
   const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
@@ -82,6 +82,35 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       return { content: [{ type: 'text', text: 'Observed page' }], details: {} };
     },
   })];
+  if (options.browseEvidence) {
+    let city = 'Moscow';
+    const url = 'https://example.com/form';
+    customTools.push(defineTool({
+      name: 'mcp__browse__snapshot', label: 'Snapshot', description: 'Read the form',
+      parameters: Type.Object({ tab: Type.String() }),
+      async execute(_id, { tab }) {
+        return { content: [{ type: 'text', text: JSON.stringify({ tab, url, snapshot: `City: ${city}` }) }], details: {} };
+      },
+    }), defineTool({
+      name: 'mcp__browse__click', label: 'Click', description: 'Update the form',
+      parameters: Type.Object({ tab: Type.String(), ref: Type.String() }),
+      async execute(_id, { ref }) {
+        if (ref === 'stale') throw new Error('The selection is stale');
+        city = 'Kazan';
+        return { content: [{ type: 'text', text: 'Selected Kazan' }], details: {} };
+      },
+    }), defineTool({
+      name: 'mcp__browse__execute', label: 'Execute', description: 'Act and return a DOM observation',
+      parameters: Type.Object({ tab: Type.String(), code: Type.String() }),
+      async execute(_id, { tab }) {
+        city = 'Perm';
+        return {
+          content: [{ type: 'text', text: `Tab: ${tab}\n${JSON.stringify({ url, dom_after: `City: ${city}` })}` }],
+          details: {},
+        };
+      },
+    }));
+  }
   if (options.screenshots || options.closeTab) {
     customTools.push(defineTool({
       name: 'mcp__browse__navigate', label: 'Navigate', description: 'Browse navigation fixture',
@@ -296,11 +325,50 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   assert.deepEqual(JSON.parse(input.content), {
     subtask_id: 'S1', description: 'Action 1', status: 'passed', observation: 'Value visible', reason: '',
     url_before: 'https://example.com/form', url_after: 'https://example.com/result',
+    browse_trace: [{ tool: 'browser_execute', input: { action: 'first' }, status: 'ok', result: 'Observed page' }],
+    dom_before: null, dom_after: null,
   });
   const [report] = env.reports();
   assert.equal(report.telemetry.llm_calls, 2);
   assert.deepEqual(report.subtask_results.map((result: { confidence_score: number }) => result.confidence_score), [95, 60]);
   assert.doesNotMatch(JSON.stringify(env.contexts), /Observed UI state/);
+});
+
+test('confidence receives the step Browse trace and only fresh DOM observations', async t => {
+  const tab = 'chrome:7';
+  const url = 'https://example.com/form';
+  const shot = (id: string) => call('mcp__browse__snapshot', id, { tab });
+  const click = (id: string, ref: string) => call('mcp__browse__click', id, { tab, ref });
+  const step = (id: string) => {
+    const tool = checkpoint(id);
+    return { ...tool, arguments: { ...tool.arguments, url_before: url, url_after: url } };
+  };
+  const env = await setup(t, [{ calls: [
+    plan(3), shot('before'), click('error', 'stale'), click('click', 'e12'), shot('after'), step('S1'),
+    call('mcp__browse__execute', 'execute', { tab, code: 'await ref("e12").click(); return { dom_after: await snapshot() };' }), step('S2'),
+    click('unobserved', 'e12'), step('S3'), finish(),
+  ] }], { browseEvidence: true });
+  await env.run();
+  const inputs = env.confidenceContexts.map(context => {
+    const input = context.messages[1];
+    assert.ok(input?.role === 'user' && typeof input.content === 'string');
+    return JSON.parse(input.content);
+  });
+  assert.equal(inputs.length, 3);
+  const [first, second, third] = inputs;
+  assert.deepEqual(first.browse_trace.map((item: { tool: string; status: string }) => [item.tool, item.status]), [
+    ['mcp__browse__snapshot', 'ok'], ['mcp__browse__click', 'error'],
+    ['mcp__browse__click', 'ok'], ['mcp__browse__snapshot', 'ok'],
+  ]);
+  assert.match(first.browse_trace[1].result, /selection is stale/);
+  assert.deepEqual(first.dom_before, { tab, url, text: 'City: Moscow' });
+  assert.deepEqual(first.dom_after, { tab, url, text: 'City: Kazan' });
+  assert.deepEqual(second.dom_before, first.dom_after);
+  assert.deepEqual(second.dom_after, { tab, url, text: 'City: Perm' });
+  assert.equal(second.browse_trace.length, 1);
+  assert.equal(third.browse_trace.length, 1);
+  assert.deepEqual(third.dom_before, second.dom_after);
+  assert.equal(third.dom_after, null);
 });
 
 test('an invalid confidence response leaves the QA verdict intact', async t => {
