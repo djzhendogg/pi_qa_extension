@@ -13,6 +13,7 @@ const QA_RULES = [
   'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. After diagnostics, a passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
   'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
+  'For each qa_checkpoint, report the observed page URLs immediately before and after the active action. Use the same URL in both fields if it stayed unchanged, and null for any URL you could not observe. Rate confidence that the action was completed correctly from 0 to 100, and briefly justify the score using browser observations and any remaining uncertainty.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
   'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
@@ -241,6 +242,10 @@ export default function qaExtension(pi: ExtensionAPI): void {
       status: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
       observation: Type.Optional(Type.String({ maxLength: 1000 })),
       reason: Type.Optional(Type.String({ maxLength: 1000 })),
+      confidence_score: Type.Number({ minimum: 0, maximum: 100, description: 'Confidence that the action was completed correctly, from 0 to 100.' }),
+      url_before: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: 'Observed absolute page URL immediately before the action, or null if unknown.' }),
+      url_after: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: 'Observed absolute page URL immediately after the action, or null if unknown.' }),
+      reasoning: Type.String({ minLength: 1, maxLength: 1000, description: 'Briefly justify confidence_score with browser observations and any remaining uncertainty.' }),
     }, { additionalProperties: false }),
     async execute(id, params, signal, _onUpdate, ctx) {
       if (run) qaToolContext = { id, ctx };

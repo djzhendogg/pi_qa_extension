@@ -71,10 +71,12 @@ Browse tools должны быть доступны в Pi. При явном о�
 2. После действия модель вызывает:
 
 ```json
-{"subtask_id":"S1","status":"passed","observation":"Форма отправлена, наблюдается переход на страницу результата","reason":""}
+{"subtask_id":"S1","status":"passed","observation":"Открылась страница результата","confidence_score":95,"url_before":"https://example.com/form","url_after":"https://example.com/result","reasoning":"На странице результата появилось подтверждение отправки. Сохранение данных отдельно не проверялось."}
 ```
 
 У `qa_checkpoint` status — passed/failed/blocked. Для passed нужна непустая observation, для failed/blocked — непустая reason; оба поля до 1000 символов. Неправильные аргументы исправимы и не меняют состояние. Дубликат не создаёт новую ревизию или screenshot. Старый контракт с `completed`/`current_objective` больше не принимается: прогресс строится extension из результатов.
+
+Для каждого статуса обязательны `confidence_score` (число от 0 до 100 включительно), `reasoning` (непустое обоснование оценки до 1000 символов), `url_before` и `url_after` (наблюдаемый абсолютный URL до и после действия). Если URL остался прежним, укажите его в обоих полях. Если URL неизвестен, передайте `null` в соответствующем поле.
 
 После принятия checkpoint extension закрывает обычные действия, сохраняет результат, ожидает диагностическую попытку и только затем при passed автоматически активирует следующую подзадачу в executing. Ответ checkpoint уже содержит её ID, описание и допустимое следующее действие; модель сразу продолжает работу через Browse. До возврата диагностики действия закрыты. При пользовательском abort следующая подзадача не активируется. При failed/blocked автоматически завершает весь run; оставшиеся подзадачи не выполняются. Внутренний screenshot допускается по происхождению вызова Pi и ожидающему checkpoint, а не только по имени инструмента.
 
@@ -139,7 +141,7 @@ qa-diagnostics/<run_id>/events.jsonl
 | `execution_status` | running / completed / incomplete / aborted / error |
 | `stage`, `active_subtask_id` | Стадия и активное действие |
 | `plan` | Фиксированные ID и descriptions |
-| `subtask_results` | Упорядоченные status, observation, reason, revision, source |
+| `subtask_results` | Результаты шагов с полями status, observation, reason, confidence_score, url_before, url_after, reasoning, revision, source |
 | `progress` | Выведенные из результатов completed ID, следующая цель и последнее observation |
 | `reported_verdict`, `verification_status` | Заявление модели; agent_reported при verdict, иначе not_evaluated |
 | `verified_verdict` | Всегда null |

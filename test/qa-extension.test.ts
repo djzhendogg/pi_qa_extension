@@ -17,7 +17,13 @@ const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_f
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
-const checkpoint = (id = 'S1', status = 'passed', observation = 'Value visible', reason = '') => call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status, observation, reason });
+const checkpoint = (id = 'S1', status = 'passed', observation = 'Value visible', reason = '') => call('qa_checkpoint', 'cp-'+id, {
+  subtask_id: id, status, observation, reason,
+  confidence_score: status === 'passed' ? 92.5 : 0,
+  url_before: 'https://example.com/form',
+  url_after: status === 'passed' ? 'https://example.com/result' : null,
+  reasoning: status === 'passed' ? 'The result page shows the saved value.' : reason,
+});
 const success = () => [plan(), browser('work'), checkpoint(), finish()];
 const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
 const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
@@ -222,6 +228,13 @@ for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: 
     assert.equal(report.execution_status, 'completed');
     assert.equal(report.scenario_id, 'TC-001');
     assert.equal(report.subtask_results.length, 1);
+    const { confidence_score, url_before, url_after, reasoning } = report.subtask_results[0];
+    assert.deepEqual({ confidence_score, url_before, url_after, reasoning }, {
+      confidence_score: 92.5,
+      url_before: 'https://example.com/form',
+      url_after: 'https://example.com/result',
+      reasoning: 'The result page shows the saved value.',
+    });
     assert.equal(report.progress.revision, 1);
     assert.equal(report.verified_verdict, null);
     assert.equal(env.requests(), 1);
