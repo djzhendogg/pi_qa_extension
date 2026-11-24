@@ -17,7 +17,7 @@ const QA_RULES = [
   'Work in tabs you opened for this case or that the user supplied. Use the tab ID returned by your opening or navigation call.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
   'When you already read DOM or the page URL inside Browse execute, return the observed snapshot or URL in that call. Do not add a browser call just for diagnostics.',
-  'Call qa_checkpoint with only the active subtask_id and status. Background diagnostics use the existing Browse results to fill in observations, reasons, and URLs.',
+  'Call qa_checkpoint with the active subtask_id and status. For failed, add a nonempty reason describing the observed failure. For blocked, add a nonempty reason describing the obstacle and the safe recovery result or why safe recovery is unavailable. Omit reason for passed.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
   'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
@@ -266,11 +266,12 @@ export default function qaExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: 'qa_checkpoint', label: 'Complete current QA action',
-    description: 'Report the status of the active subtask. Use passed for observed success, failed for observed nonperformance, or blocked for a persistent obstacle. A passed checkpoint immediately activates and returns the next task. The last passed checkpoint requires qa_finish. Diagnostics run in the background.',
+    description: 'Report the status of the active subtask. Use passed for observed success, failed for observed nonperformance, or blocked for a persistent obstacle. Failed and blocked require reason. A passed checkpoint immediately activates the next task or requires qa_finish if it is the last one. Diagnostics run in the background.',
     executionMode: 'sequential',
     parameters: Type.Object({
       subtask_id: Type.String(),
       status: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
+      reason: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: 'Required for failed or blocked. State the observed failure, or the obstacle and recovery result or why safe recovery is unavailable. Omit for passed.' })),
     }, { additionalProperties: false }),
     async execute(id, params, signal, _onUpdate, ctx) {
       if (run) qaToolContext = { id, ctx };

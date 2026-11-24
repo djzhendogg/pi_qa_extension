@@ -14,14 +14,14 @@ const prompt = [
   'Read browse_trace in call order, including errors and recoveries. Compare the labeled before and after screenshots. The initial screenshot may show a blank page before navigation. A background capture may include a later action, so corroborate it against the trace.',
   'The reported status is a claim. A passed status alone is insufficient. Use a lower score when evidence is missing, indirect or contradictory.',
   'Use the URLs only as supporting evidence. Identify the strongest observation and any material uncertainty. Do not add requirements or change the reported status.',
-  'Return only JSON with observation, reason, confidence_score, and reasoning. observation is a brief factual summary of what the browser showed, or null if unknown. reason is the evidenced cause for failed or blocked, or null if passed or the cause is unknown. Keep observation and reason under 1000 characters.',
+  'Return only JSON with observation, confidence_score, and reasoning. observation is a brief factual summary of what the browser showed, or null if unknown. Keep observation at most 1000 characters.',
   'confidence_score is a number from 0 to 100. reasoning is one or two concise sentences in the language of the step.',
 ].join('\n');
 
-function diagnosticText(value: unknown, field: string): string | null {
+function parseObservation(value: unknown): string | null {
   if (value === null) return null;
   if (typeof value !== 'string' || !value.trim() || value.length > 1000) {
-    throw new Error(`${field} must be null or nonempty text of at most 1000 characters`);
+    throw new Error('observation must be null or nonempty text of at most 1000 characters');
   }
   return value.trim();
 }
@@ -30,7 +30,7 @@ function parseEstimate(text: string): ConfidenceEstimate {
   const fenced = /^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$/i.exec(text);
   const value: unknown = JSON.parse(fenced?.[1] ?? text);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected a confidence JSON object');
-  const { confidence_score, reasoning, observation, reason } = value as Record<string, unknown>;
+  const { confidence_score, reasoning, observation } = value as Record<string, unknown>;
   if (typeof confidence_score !== 'number' || !Number.isFinite(confidence_score) || confidence_score < 0 || confidence_score > 100) {
     throw new Error('confidence_score must be a number from 0 to 100');
   }
@@ -39,7 +39,7 @@ function parseEstimate(text: string): ConfidenceEstimate {
   }
   return {
     confidence_score, reasoning: reasoning.trim(),
-    observation: diagnosticText(observation, 'observation'), reason: diagnosticText(reason, 'reason'),
+    observation: parseObservation(observation),
   };
 }
 

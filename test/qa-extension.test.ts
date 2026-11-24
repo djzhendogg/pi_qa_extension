@@ -20,7 +20,10 @@ const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_f
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
-const checkpoint = (id = 'S1', status = 'passed') => call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status });
+const checkpoint = (id = 'S1', status = 'passed') => call('qa_checkpoint', 'cp-'+id, {
+  subtask_id: id, status,
+  ...(status === 'failed' || status === 'blocked' ? { reason: 'Required access unavailable.' } : {}),
+});
 const success = () => [plan(), browser('work'), checkpoint(), finish()];
 const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
 const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
@@ -219,7 +222,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       if (confidence) {
         confidenceContexts.push(structuredClone(context));
         const answer = await options.assessConfidence?.(context, streamOptions)
-          ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value.","observation":"Value visible","reason":null}';
+          ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value.","observation":"Value visible"}';
         text = typeof answer === 'string' ? answer : answer.text;
         confidenceStop = typeof answer === 'string' ? undefined : answer.stopReason;
       } else if (!aborted) {
@@ -354,7 +357,7 @@ test('confidence waits for both images in the background and shares adjacent che
       await wait;
       return JSON.stringify({
         confidence_score: JSON.stringify(context).includes('Action 2') ? 60 : 95,
-        reasoning: 'Observed UI state', observation: 'Value visible', reason: null,
+        reasoning: 'Observed UI state', observation: 'Value visible',
       });
     },
   });
@@ -457,7 +460,7 @@ for (const [failure, firstAnswer] of [
     visual: 'ready',
     assessConfidence(_context, options) {
       attempts.push(options);
-      return attempts.length === 1 ? firstAnswer : '{"confidence_score":96,"reasoning":"The page confirms success.","observation":"Saved","reason":null}';
+      return attempts.length === 1 ? firstAnswer : '{"confidence_score":96,"reasoning":"The page confirms success.","observation":"Saved"}';
     },
   });
   await env.run();
@@ -539,7 +542,7 @@ test('invalid checkpoint stays recoverable and duplicate cannot add a revision',
 for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint captures once and stops later siblings`, async t => {
   const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint('S1', status), screenshot(), browser('after')] }], {
     visual: 'ready',
-    assessConfidence: () => '{"confidence_score":10,"reasoning":"Access failed.","observation":null,"reason":"Required access unavailable."}',
+    assessConfidence: () => '{"confidence_score":10,"reasoning":"Access failed.","observation":null}',
   });
   await env.run(); assert.deepEqual(env.actions, ['navigate']);
   assert.equal(env.screenshotCalls.filter(call => (call as { tab: string }).tab === 'chrome:7').length, 1);
@@ -547,6 +550,7 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
   assert.equal(report.reported_verdict, status);
   assert.equal(report.reason, 'Required access unavailable.');
   assert.equal(report.subtask_results[0].reason, report.reason);
+  assert.equal(report.subtask_results[0].confidence_score, 10);
   assert.equal(report.subtask_results.length, 1);
   assert.ok(existsSync(join(env.dir, 'qa-diagnostics', report.run_id, 'checkpoint-001.png')));
   assert.equal(env.requests(), 1); assert.deepEqual(env.extensionErrors, []);
