@@ -13,6 +13,9 @@ const model: Model<'openai-completions'> = {
   input: ['text'], contextWindow: 128000, maxTokens: 1024,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
+const visualModel: Model<'openai-completions'> = {
+  ...model, provider: 'qa-diagnostics', id: 'qa-visual', input: ['text', 'image'],
+};
 const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_finish', arguments: { verdict: 'passed' } });
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
@@ -25,7 +28,7 @@ const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'c
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
 type ConfidenceReply = string | { text: string; stopReason: 'error' | 'length' };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext, options?: SimpleStreamOptions) => ConfidenceReply | Promise<ConfidenceReply>; browseEvidence?: boolean } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext, options?: SimpleStreamOptions) => ConfidenceReply | Promise<ConfidenceReply>; browseEvidence?: boolean; visual?: 'ready' | 'missing-model'; baselineOpenError?: boolean; beforeScreenshot?: (tab: string, index: number) => Promise<void> | undefined } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
   const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
@@ -64,6 +67,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   const screenshotCalls: unknown[] = [];
   const closeCalls: unknown[] = [];
   const lifecycle: string[] = [];
+  let baselineId: string | undefined;
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jFbkAAAAASUVORK5CYII=';
   const customTools: ToolDefinition[] = [defineTool({
     name: 'browser_execute', label: 'browser', description: 'Test browser side effect',
@@ -108,7 +112,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       },
     }));
   }
-  if (options.screenshots || options.closeTab) {
+  if (options.screenshots || options.closeTab || options.visual) {
     customTools.push(defineTool({
       name: 'mcp__browse__navigate', label: 'Navigate', description: 'Browse navigation fixture',
       parameters: Type.Object({ tab: Type.String() }),
@@ -117,19 +121,22 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
         return { content: [{ type: 'text', text: JSON.stringify({ tab: params.tab }) }], details: {} };
       },
     }));
-    if (options.screenshots) customTools.push(defineTool({
+    if (options.screenshots || options.visual) customTools.push(defineTool({
       name: 'mcp__browse__screenshot', label: 'Screenshot', description: 'Capture the tab as an image',
       parameters: Type.Object({ tab: Type.String(), format: Type.Optional(Type.Literal('png')) }),
       async execute(_id, params) {
+        const index = screenshotCalls.length;
         screenshotCalls.push(params);
         lifecycle.push('screenshot');
         options.captureStarted?.();
         await options.captureWait;
+        await options.beforeScreenshot?.(params.tab, index);
         if (options.screenshots === 'error') throw new Error('Screenshot backend unavailable');
+        const data = options.visual ? Buffer.concat([Buffer.from(png, 'base64'), Buffer.from([index])]).toString('base64') : png;
         return {
-          content: [{ type: 'image', data: png, mimeType: 'image/png' }],
-          details: { duplicateImage: { type: 'image', data: png, mimeType: 'image/png' } },
-          structuredContent: { media: [{ type: 'image', data: png, mimeType: 'image/png' }] },
+          content: [{ type: 'image', data, mimeType: 'image/png' }],
+          details: { duplicateImage: { type: 'image', data, mimeType: 'image/png' } },
+          structuredContent: { media: [{ type: 'image', data, mimeType: 'image/png' }] },
         };
       },
     }));
@@ -145,17 +152,45 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       writeFileSync(join(dir, 'qa-diagnostics'), 'not a directory');
     }
   }
-  if (options.closeTab) customTools.push(defineTool({
+  if (options.closeTab || options.visual) customTools.push(defineTool({
     name: 'mcp__browse__tabs', label: 'Browse tabs', description: 'List, open or close Browse tabs',
-    parameters: Type.Object({ action: Type.Optional(Type.String({ enum: ['list', 'new', 'close'] })), tab: Type.Optional(Type.Union([Type.Integer(), Type.String()])) }),
+    parameters: Type.Object({
+      action: Type.Optional(Type.String({ enum: ['list', 'new', 'close'] })),
+      tab: Type.Optional(Type.Union([Type.Integer(), Type.String()])),
+      ...(options.visual ? { id: Type.Optional(Type.String()) } : {}),
+    }),
     async execute(_id, params, signal) {
       assert.equal(signal?.aborted, false);
-      if (params.action === 'list' || params.action === undefined) return { content: [{ type: 'text', text: JSON.stringify({ tabs: [{ tab: 999 }] }) }], details: {} };
+      if (params.action === 'list' || params.action === undefined) {
+        const tabs: Array<Record<string, string | number>> = [{ tab: 999 }];
+        if (baselineId) tabs.push({ tab: 'baseline', id: baselineId });
+        const payload = { tabs };
+        return { content: [{ type: 'text', text: JSON.stringify(payload) }], details: {}, structuredContent: payload };
+      }
+      if (options.visual && params.action === 'new') {
+        assert.ok(typeof params.id === 'string');
+        baselineId = params.id;
+        if (options.baselineOpenError) return { content: [{ type: 'text', text: 'Open result lost' }], details: {}, isError: true };
+        return { content: [{ type: 'text', text: JSON.stringify({ tab: 'baseline', id: baselineId }) }], details: {} };
+      }
       assert.equal(params.action, 'close');
+      if (options.visual && (params.tab === 'baseline' || params.tab === baselineId)) {
+        baselineId = undefined;
+        lifecycle.push('close-baseline');
+        return { content: [{ type: 'text', text: 'Baseline closed' }], details: {} };
+      }
       assert.equal(params.tab, 'chrome:7');
       closeCalls.push(params); lifecycle.push('close'); options.onClose?.();
       if (options.closeTab === 'throw') throw new Error('Close disconnected');
       return { content: [{ type: 'text', text: 'Tab close response' }], details: {}, isError: options.closeTab === 'error' };
+    },
+  }));
+  if (options.visual) customTools.push(defineTool({
+    name: 'mcp__browse__status', label: 'Browse status', description: 'List available tabs and relay status',
+    parameters: Type.Object({}),
+    async execute() {
+      const tabs = baselineId ? [{ tab: 999 }, { tab: 'baseline', id: baselineId }] : [{ tab: 999 }];
+      return { content: [{ type: 'text', text: JSON.stringify({ connected: true, tabs }) }], details: {} };
     },
   }));
   const { session } = await createAgentSession({
@@ -171,11 +206,13 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   let requests = 0;
   let started!: () => void;
   const whenRequested = new Promise<void>(resolve => { started = resolve; });
-  const deterministicStream = (_model: Model<Api>, context: TranscriptContext, streamOptions?: SimpleStreamOptions) => {
+  const deterministicStream = (requestedModel: Model<Api>, context: TranscriptContext, streamOptions?: SimpleStreamOptions) => {
     const stream = createAssistantMessageEventStream();
     void (async () => {
       const aborted = streamOptions?.signal?.aborted;
       const confidence = getCurrentSystemPrompt(context.messages).startsWith('Assess the confidence');
+      assert.equal(requestedModel.provider, confidence ? visualModel.provider : model.provider);
+      assert.equal(requestedModel.id, confidence ? visualModel.id : model.id);
       const reply = aborted ? { stopReason: 'aborted' as const } : confidence ? undefined : replies[requests];
       let text = 'Done';
       let confidenceStop: 'error' | 'length' | undefined;
@@ -218,6 +255,10 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   session.modelRuntime.registerProvider('qa-test', {
     api: model.api, baseUrl: model.baseUrl, apiKey: 'local-test-placeholder', models: [model],
     streamSimple: deterministicStream,
+  });
+  if (options.visual === 'ready') session.modelRuntime.registerProvider(visualModel.provider, {
+    api: visualModel.api, baseUrl: visualModel.baseUrl, apiKey: 'local-test-placeholder',
+    models: [visualModel], streamSimple: deterministicStream,
   });
   const extensionErrors: string[] = [];
   await session.bindExtensions({ mode: 'print', onError: error => extensionErrors.push(error.error) });
@@ -264,10 +305,10 @@ for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: 
     assert.equal(report.subtask_results.length, 1);
     const { confidence_score, url_before, url_after, reasoning } = report.subtask_results[0];
     assert.deepEqual({ confidence_score, url_before, url_after, reasoning }, {
-      confidence_score: 92.5,
+      confidence_score: null,
       url_before: null,
       url_after: null,
-      reasoning: 'The result page shows the saved value.',
+      reasoning: null,
     });
     assert.equal(report.progress.revision, 1);
     assert.equal(report.verified_verdict, null);
@@ -292,15 +333,23 @@ test('QA requests replace Pi coding instructions and retain case, progress, and 
   assert.match(getCurrentSystemPrompt(env.contexts[2].messages), /"subtask_id":"S1"/);
 });
 
-test('confidence runs outside the QA dialog and updates the original checkpoint', async t => {
-  let release!: () => void, nextRequest!: () => void;
+test('confidence waits for both images in the background and shares adjacent checkpoint images', async t => {
+  let release!: () => void, releaseBaseline!: () => void, releaseCapture!: () => void, secondCheckpoint!: () => void;
   const wait = new Promise<void>(resolve => { release = resolve; });
-  const continued = new Promise<void>(resolve => { nextRequest = resolve; });
+  const waitForBaseline = new Promise<void>(resolve => { releaseBaseline = resolve; });
+  const waitForCapture = new Promise<void>(resolve => { releaseCapture = resolve; });
+  const continued = new Promise<void>(resolve => { secondCheckpoint = resolve; });
+  let workingCaptures = 0;
   const env = await setup(t, [
-    { calls: [plan(2), browser('first'), checkpoint(), browser('second')] },
+    { calls: [plan(2), navigate(), browser('first'), checkpoint(), call('mcp__browse__tabs', 'list', { action: 'list' }), call('mcp__browse__status', 'status', {}), browser('second')] },
     { calls: [checkpoint('S2'), finish()] },
   ], {
-    onRequest: count => { if (count === 2) nextRequest(); },
+    visual: 'ready',
+    beforeScreenshot(tab) {
+      if (tab === 'baseline') return waitForBaseline;
+      if (++workingCaptures === 1) return waitForCapture;
+      secondCheckpoint();
+    },
     async assessConfidence(context) {
       await wait;
       return JSON.stringify({
@@ -312,10 +361,13 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   const running = env.run();
   try {
     await Promise.race([continued, running]);
-    assert.deepEqual(env.actions, ['first', 'second']);
+    assert.deepEqual(env.actions, ['navigate', 'first', 'second']);
+    assert.equal(env.confidenceContexts.length, 0);
     assert.equal(env.reports()[0].subtask_results[0].confidence_status, 'pending');
     assert.equal(env.reports()[0].subtask_results[0].confidence_score, null);
   } finally {
+    releaseBaseline();
+    releaseCapture();
     release();
     await running;
   }
@@ -323,21 +375,47 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   assert.equal(env.confidenceContexts.length, 2);
   const [context] = env.confidenceContexts;
   assert.deepEqual(getCurrentTools(context.messages), []);
-  const input = context.messages[1];
-  assert.ok(input?.role === 'user' && typeof input.content === 'string');
   assert.equal(context.messages.length, 2);
-  assert.deepEqual(JSON.parse(input.content), {
+  const [input, firstImages] = confidenceInput(context);
+  assert.deepEqual(input, {
     subtask_id: 'S1', description: 'Action 1', status: 'passed', url_before: null, url_after: null,
-    browse_trace: [{ tool: 'browser_execute', input: { action: 'first' }, status: 'ok', result: 'Observed page' }],
-    dom_before: null, dom_after: null,
+    browse_trace: [
+      { tool: 'mcp__browse__navigate', input: { tab: 'chrome:7' }, status: 'ok', result: '{"tab":"chrome:7"}' },
+      { tool: 'browser_execute', input: { action: 'first' }, status: 'ok', result: 'Observed page' },
+    ],
   });
   const [report] = env.reports();
+  const [secondInput, secondImages] = confidenceInput(env.confidenceContexts[1]);
+  assert.equal(secondInput.browse_trace[0].result, '{"tabs":[{"tab":999}]}');
+  assert.equal(secondInput.browse_trace[1].result, '{"connected":true,"tabs":[{"tab":999}]}');
+  const tabList = env.session.messages.find(message => message.role === 'toolResult' && message.toolCallId === 'list');
+  assert.ok(tabList?.role === 'toolResult');
+  assert.deepEqual(tabList.content, [{ type: 'text', text: '{"tabs":[{"tab":999}]}' }]);
+  const leaked = env.contexts.flatMap(context => context.messages)
+    .map(message => JSON.stringify(message)).find(message => /qa-baseline-|"tab":"baseline"/.test(message));
+  assert.equal(leaked, undefined);
+  const diagnosticsDir = join(env.dir, 'qa-diagnostics', report.run_id);
+  assert.deepEqual([...firstImages, secondImages[1]].map(block => block.data), ['baseline', 'checkpoint-001', 'checkpoint-002']
+    .map(name => readFileSync(join(diagnosticsDir, `${name}.png`)).toString('base64')));
+  assert.deepEqual(firstImages[1], secondImages[0]);
+  assert.deepEqual(env.closeCalls, [{ action: 'close', tab: 'chrome:7' }]);
+  assert.equal(env.lifecycle.filter(event => event === 'close-baseline').length, 1);
   assert.equal(report.telemetry.llm_calls, 2);
   assert.deepEqual(report.subtask_results.map((result: { confidence_score: number }) => result.confidence_score), [95, 60]);
   assert.doesNotMatch(JSON.stringify(env.contexts), /Observed UI state/);
 });
 
-test('confidence receives the step Browse trace and only fresh DOM observations', async t => {
+function confidenceInput(context: TranscriptContext) {
+  const input = context.messages[1];
+  assert.ok(input?.role === 'user' && Array.isArray(input.content));
+  const [evidence, before, beforeImage, after, afterImage] = input.content;
+  assert.equal(input.content.length, 5);
+  assert.ok(evidence.type === 'text' && before.type === 'text' && beforeImage.type === 'image' && after.type === 'text' && afterImage.type === 'image');
+  assert.deepEqual([before.text, after.text], ['Before the subtask', 'After the subtask']);
+  return [JSON.parse(evidence.text), [beforeImage, afterImage]] as const;
+}
+
+test('confidence receives the step Browse trace and URL observations', async t => {
   const tab = 'chrome:7';
   const url = 'https://example.com/form';
   const shot = (id: string) => call('mcp__browse__snapshot', id, { tab });
@@ -346,13 +424,9 @@ test('confidence receives the step Browse trace and only fresh DOM observations'
     plan(3), shot('before'), click('error', 'stale'), click('click', 'e12'), shot('after'), checkpoint('S1'),
     call('mcp__browse__execute', 'execute', { tab, code: 'await ref("e12").click(); return { dom_after: await snapshot() };' }), checkpoint('S2'),
     click('unobserved', 'e12'), checkpoint('S3'), finish(),
-  ] }], { browseEvidence: true });
+  ] }], { browseEvidence: true, visual: 'ready' });
   await env.run();
-  const inputs = env.confidenceContexts.map(context => {
-    const input = context.messages[1];
-    assert.ok(input?.role === 'user' && typeof input.content === 'string');
-    return JSON.parse(input.content);
-  });
+  const inputs = env.confidenceContexts.map(context => confidenceInput(context)[0]);
   assert.equal(inputs.length, 3);
   const [first, second, third] = inputs;
   assert.deepEqual(first.browse_trace.map((item: { tool: string; status: string }) => [item.tool, item.status]), [
@@ -360,14 +434,13 @@ test('confidence receives the step Browse trace and only fresh DOM observations'
     ['mcp__browse__click', 'ok'], ['mcp__browse__snapshot', 'ok'],
   ]);
   assert.match(first.browse_trace[1].result, /selection is stale/);
-  assert.deepEqual(first.dom_before, { tab, url, text: 'City: Moscow' });
-  assert.deepEqual(first.dom_after, { tab, url, text: 'City: Kazan' });
-  assert.deepEqual(second.dom_before, first.dom_after);
-  assert.deepEqual(second.dom_after, { tab, url, text: 'City: Perm' });
+  assert.match(first.browse_trace[3].result, /City: Kazan/);
   assert.equal(second.browse_trace.length, 1);
   assert.equal(third.browse_trace.length, 1);
-  assert.deepEqual(third.dom_before, second.dom_after);
-  assert.equal(third.dom_after, null);
+  for (const input of inputs) {
+    assert.equal('dom_before' in input, false);
+    assert.equal('dom_after' in input, false);
+  }
   const [report] = env.reports();
   assert.deepEqual(report.subtask_results.map((step: { url_before: string | null; url_after: string | null }) => [step.url_before, step.url_after]), [
     [url, url], [url, url], [url, null],
@@ -380,7 +453,8 @@ for (const [failure, firstAnswer] of [
   ['invalid JSON', '{"confidence_score":'],
 ] as const) test(`confidence retries once after ${failure} with thinking off and 2048 tokens`, async t => {
   const attempts: Array<SimpleStreamOptions | undefined> = [];
-  const env = await setup(t, [{ calls: success() }], {
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint(), finish()] }], {
+    visual: 'ready',
     assessConfidence(_context, options) {
       attempts.push(options);
       return attempts.length === 1 ? firstAnswer : '{"confidence_score":96,"reasoning":"The page confirms success.","observation":"Saved","reason":null}';
@@ -404,7 +478,7 @@ for (const [failure, firstAnswer] of [
 test('two invalid confidence responses leave the QA verdict intact', async t => {
   const snapshot = call('mcp__browse__snapshot', 'snapshot', { tab: 'chrome:7' });
   const env = await setup(t, [{ calls: [plan(), snapshot, checkpoint(), finish()] }], {
-    browseEvidence: true, assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}',
+    browseEvidence: true, visual: 'ready', assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}',
   });
   await env.run();
   const [report] = env.reports();
@@ -418,6 +492,32 @@ test('two invalid confidence responses leave the QA verdict intact', async t => 
   assert.equal(step.reason, null);
   assert.equal(step.url_before, 'https://example.com/form');
   assert.equal(step.url_after, 'https://example.com/form');
+});
+
+for (const missing of ['visual model', 'screenshots', 'screenshot storage'] as const) test(`missing ${missing} fails only confidence`, async t => {
+  const snapshot = call('mcp__browse__snapshot', 'snapshot', { tab: 'chrome:7' });
+  const env = await setup(t, [{ calls: [plan(), snapshot, checkpoint(), finish()] }], {
+    browseEvidence: true, visual: missing === 'visual model' ? 'missing-model' : 'ready',
+    screenshots: missing === 'screenshots' ? 'error' : missing === 'screenshot storage' ? 'bad-storage' : undefined,
+  });
+  await env.run();
+  const [report] = env.reports();
+  assert.equal(report.reported_verdict, 'passed');
+  assert.equal(report.telemetry.confidence_llm_calls, 0);
+  assert.equal(report.subtask_results[0].confidence_status, 'failed');
+  assert.equal(report.subtask_results[0].url_after, 'https://example.com/form');
+});
+
+test('cleans up by the chosen baseline ID after a failed open result', async t => {
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint(), finish()] }], {
+    visual: 'ready', baselineOpenError: true,
+  });
+  await env.run();
+  const [report] = env.reports();
+  assert.equal(report.reported_verdict, 'passed');
+  assert.equal(report.subtask_results[0].confidence_status, 'failed');
+  assert.equal(env.lifecycle.filter(event => event === 'close-baseline').length, 1);
+  assert.deepEqual(env.closeCalls, [{ action: 'close', tab: 'chrome:7' }]);
 });
 
 test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs in a mixed packet', async t => {
@@ -438,11 +538,11 @@ test('invalid checkpoint stays recoverable and duplicate cannot add a revision',
 
 for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint captures once and stops later siblings`, async t => {
   const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint('S1', status), screenshot(), browser('after')] }], {
-    screenshots: 'ok',
+    visual: 'ready',
     assessConfidence: () => '{"confidence_score":10,"reasoning":"Access failed.","observation":null,"reason":"Required access unavailable."}',
   });
   await env.run(); assert.deepEqual(env.actions, ['navigate']);
-  assert.equal(env.screenshotCalls.length, 1);
+  assert.equal(env.screenshotCalls.filter(call => (call as { tab: string }).tab === 'chrome:7').length, 1);
   const [report] = env.reports();
   assert.equal(report.reported_verdict, status);
   assert.equal(report.reason, 'Required access unavailable.');
@@ -666,7 +766,7 @@ test('standalone screenshots are denied during active QA work; checkpoint captur
   const denied = env.session.messages.filter(m => m.role === 'toolResult' && m.toolName === 'mcp__browse__screenshot');
   assert.equal(denied.length, 2);
   assert.ok(denied.every(m => m.role === 'toolResult' && m.isError));
-  assert.ok(denied.every(m => m.role === 'toolResult' && JSON.stringify(m.content).includes('qa_checkpoint')));
+  assert.ok(denied.every(m => m.role === 'toolResult' && JSON.stringify(m.content).includes('captures diagnostics automatically')));
   assert.equal(env.reports()[0].reported_verdict, 'passed');
   assert.equal(env.reports()[0].progress.revision, 1);
   assert.deepEqual(env.extensionErrors, []);
@@ -683,7 +783,7 @@ test('nested model screenshot call cannot bypass checkpoint-only gate', async t 
 });
 
 test('qa_finish schema requires only verdict; passed report uses checkpoint observations', async t => {
-  const env = await setup(t, [{ calls: [plan(), browser('work'), checkpoint(), finish()] }]);
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint(), finish()] }], { visual: 'ready' });
   await env.run();
   const tool = getCurrentTools(env.contexts[0].messages).find(tool => tool.name === 'qa_finish');
   const schema = tool?.parameters as { properties: Record<string, unknown>; required: string[] };

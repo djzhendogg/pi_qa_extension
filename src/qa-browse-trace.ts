@@ -10,11 +10,8 @@ interface TraceEntry {
   status: 'ok' | 'error' | 'pending';
   result: string | null;
 }
-interface DomObservation { tab: Tab; url: string | null; text: string }
 export interface BrowseEvidence extends ObservedUrls {
   browse_trace: TraceEntry[];
-  dom_before: DomObservation | null;
-  dom_after: DomObservation | null;
 }
 interface StepCall {
   entry: TraceEntry;
@@ -23,8 +20,6 @@ interface StepCall {
   inputTab?: Tab;
   tab?: Tab;
   readOnly: boolean;
-  before?: DomObservation;
-  after?: DomObservation;
   urlBefore?: string | null;
   urlAfter?: string | null;
 }
@@ -41,7 +36,6 @@ const secretKey = /password|passcode|passwd|credential|secret|token|authorizatio
 const secretValue = /(["']?(?:password|passcode|token|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|authorization|api[_-]?key|cookie|set-cookie|session[_-]?(?:id|key)|otp)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,}&]+)/gi;
 const pageNeutralTools = /^(?:status|settings|network|console|recording|screenshot_diff|secrets(?:_.*)?)$/;
 const sensitiveTools = /^(?:network|secrets(?:_|$)|upload|settings|webmcp|screenshot_diff)/;
-const snapshotScript = /(?:^|[;\n])\s*(?:return\s+)?(?:await\s+)?(?:snapshot|ariaSnapshot)\(\s*\)\s*;?\s*$/;
 const readOnlySnapshotScript = /^\s*(?:return\s+)?(?:await\s+)?(?:snapshot|ariaSnapshot)\(\s*\)\s*;?\s*$/;
 const readOnlyUrlScript = /^\s*(?:return\s+)?(?:await\s+)?page\.url\(\s*\)\s*;?\s*$/;
 
@@ -124,7 +118,6 @@ function pageKey(namespace: string, tab: Tab): string {
 export class QaBrowseTrace {
   private calls: StepCall[] = [];
   private pending = new Map<string, StepCall>();
-  private lastDom = new Map<string, DomObservation>();
   private lastUrl = new Map<string, string>();
 
   begin(event: BrowseCall, tools: readonly CatalogTool[]): void {
@@ -161,31 +154,15 @@ export class QaBrowseTrace {
     const plainUrl = typeof result === 'string' ? result : body;
     const resultUrl = /^(?:https?:\/\/[^\s]+|about:blank)$/i.test(plainUrl) ? plainUrl : null;
     call.urlBefore = cleanUrl(fields?.url_before ?? payload?.url_before);
-    const url = call.urlAfter = cleanUrl(fields?.url_after ?? payload?.url_after ?? fields?.url ?? payload?.url ?? headerUrl ?? resultUrl);
-    const dom = (value: unknown, address: string | null = url): DomObservation | undefined => {
-      const snippet = typeof value === 'string' ? excerpt(value, 2400) : '';
-      return snippet ? { tab, url: address, text: snippet } : undefined;
-    };
-    call.after = dom(fields?.dom_after ?? fields?.snapshot);
-    const snapshotRead = ['snapshot', 'aria_snapshot'].includes(call.operation)
-      || (call.operation === 'execute' && snapshotScript.test(script(event.input)));
-    if (!call.after && snapshotRead) {
-      call.after = dom(typeof result === 'string' ? result : fields?.text ?? (parsedBody === undefined ? body : undefined));
-    }
-    if (call.operation === 'execute') {
-      call.before = dom(fields?.dom_before, call.urlBefore ?? (call.readOnly ? url : null));
-    }
+    call.urlAfter = cleanUrl(fields?.url_after ?? payload?.url_after ?? fields?.url ?? payload?.url ?? headerUrl ?? resultUrl);
   }
 
   finish(): BrowseEvidence {
     let started = false;
     let changed = false;
     let firstPage: string | undefined;
-    let before: DomObservation | null = null;
-    let after: DomObservation | null = null;
     let url_before: string | null = null;
     let url_after: string | null = null;
-    const currentDom = new Map<string, DomObservation>();
     for (const call of this.calls) {
       if (pageNeutralTools.test(call.operation) || (call.operation === 'tabs' && !['new', 'close'].includes(String(call.entry.input.action)))) continue;
       const inputKey = call.inputTab === undefined ? undefined : pageKey(call.namespace, call.inputTab);
@@ -193,36 +170,18 @@ export class QaBrowseTrace {
       const initialKey = inputKey ?? outputKey;
       if (!started) {
         firstPage = initialKey;
-        before = call.before ?? (call.readOnly ? call.after : undefined) ?? (initialKey ? this.lastDom.get(initialKey) : undefined) ?? null;
         url_before = call.urlBefore ?? (call.readOnly ? call.urlAfter : null) ?? (initialKey ? this.lastUrl.get(initialKey) : null) ?? null;
         started = true;
       } else if (!changed && initialKey && initialKey === firstPage) {
-        before = call.before ?? (call.readOnly ? call.after : undefined) ?? before;
         url_before = call.urlBefore ?? (call.readOnly ? call.urlAfter : null) ?? url_before;
       }
       if (!call.readOnly) {
         changed = true;
-        if (initialKey) {
-          this.lastDom.delete(initialKey);
-          this.lastUrl.delete(initialKey);
-          currentDom.delete(initialKey);
-        } else {
-          this.lastDom.clear();
-          this.lastUrl.clear();
-          currentDom.clear();
-        }
-        if (outputKey) {
-          this.lastDom.delete(outputKey);
-          this.lastUrl.delete(outputKey);
-          currentDom.delete(outputKey);
-        }
-      }
-      if (outputKey && call.after) {
-        this.lastDom.set(outputKey, call.after);
-        currentDom.set(outputKey, call.after);
+        if (initialKey) this.lastUrl.delete(initialKey);
+        else this.lastUrl.clear();
+        if (outputKey) this.lastUrl.delete(outputKey);
       }
       if (outputKey && call.urlAfter) this.lastUrl.set(outputKey, call.urlAfter);
-      after = (outputKey ? currentDom.get(outputKey) : undefined) ?? null;
       url_after = (outputKey ? this.lastUrl.get(outputKey) : undefined) ?? null;
     }
     // Preserve the call sequence and favor the most recent text when the trace is large.
@@ -235,11 +194,6 @@ export class QaBrowseTrace {
     const browse_trace = this.calls.map(call => call.entry);
     this.calls = [];
     this.pending.clear();
-    return {
-      browse_trace,
-      dom_before: before?.url && url_before && before.url !== url_before ? null : before,
-      dom_after: after?.url && url_after && after.url !== url_after ? null : after,
-      url_before, url_after,
-    };
+    return { browse_trace, url_before, url_after };
   }
 }

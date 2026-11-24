@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { parseTestCase, QaRun } from './qa-state.ts';
-import { QaDiagnostics, isScreenshot, stripModelImages } from './qa-diagnostics.ts';
+import { QaDiagnostics, isScreenshot, qaModelContext, type DiagnosticImage } from './qa-diagnostics.ts';
 import { QaTabCleanup } from './qa-tab-cleanup.ts';
 import { QaConfidence } from './qa-confidence.ts';
 import { QaBrowseTrace } from './qa-browse-trace.ts';
@@ -13,9 +13,10 @@ const QA_RULES = [
   'First call qa_plan with S1, S2, ... and descriptions. It saves the plan and activates S1. Preserve all explicit actions, values and checks. Do not add business success criteria.',
   'Granularity follows the wording: "fill and submit the form" is one subtask even with multiple browser calls; "select X in dropdown, enter Y in field, submit" is three subtasks. Do not split every click or merge explicitly listed actions.',
   'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. A passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
-  'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
+  'Use DOM and text observations. Screenshots for QA diagnostics are captured automatically; do not call screenshot directly or through another tool.',
+  'Work in tabs you opened for this case or that the user supplied. Use the tab ID returned by your opening or navigation call.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
-  'When you already read DOM or the page URL inside Browse execute, return the observed snapshot or URL in that call. Use dom_before, dom_after, or url as appropriate. Do not add a browser call just for diagnostics.',
+  'When you already read DOM or the page URL inside Browse execute, return the observed snapshot or URL in that call. Do not add a browser call just for diagnostics.',
   'Call qa_checkpoint with only the active subtask_id and status. Background diagnostics use the existing Browse results to fill in observations, reasons, and URLs.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
@@ -42,6 +43,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
   let diagnostics: QaDiagnostics | undefined;
   let confidence: QaConfidence | undefined;
   let browseTrace: QaBrowseTrace | undefined;
+  let previousScreenshot: Promise<DiagnosticImage | undefined> = Promise.resolve(undefined);
   let cleanup: QaTabCleanup | undefined;
   let qaToolContext: { id: string; ctx: ExtensionToolContext } | undefined;
   let startupError: string | undefined;
@@ -51,7 +53,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
   pi.registerFlag('qa-case-json', { description: 'Inline JSON scenario (scenario_id, url, task)', type: 'string' });
   pi.registerFlag('qa-case', { description: 'JSON QA case to load before the first prompt', type: 'string' });
   pi.registerFlag('qa-results-dir', { description: 'QA JSON report directory (default: ./qa-results)', type: 'string' });
-  pi.registerFlag('qa-diagnostics-dir', { description: 'Human-only screenshot directory (default: ./qa-diagnostics)', type: 'string' });
+  pi.registerFlag('qa-diagnostics-dir', { description: 'QA screenshot directory (default: ./qa-diagnostics)', type: 'string' });
 
   function load(source: string, ctx: ExtensionContext, inline = false): void {
     if (run && !run.isTerminal) throw new Error('A QA case is already running');
@@ -65,6 +67,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     cleanup = new QaTabCleanup(log);
     confidence = new QaConfidence(log);
     browseTrace = new QaBrowseTrace();
+    previousScreenshot = Promise.resolve(undefined);
     qaToolContext = undefined;
     startupError = undefined;
     lastOutcome = 'completed';
@@ -110,6 +113,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     diagnostics = undefined;
     confidence = undefined;
     browseTrace = undefined;
+    previousScreenshot = Promise.resolve(undefined);
     cleanup = undefined;
     qaToolContext = undefined;
     startupError = undefined;
@@ -157,8 +161,8 @@ export default function qaExtension(pi: ExtensionAPI): void {
     if (run) {
       // Pi summarizes preparation text separately from the main context hook.
       // Sanitize its copies too, so legacy inline image data is not replayed.
-      event.preparation.messagesToSummarize = stripModelImages(event.preparation.messagesToSummarize);
-      event.preparation.turnPrefixMessages = stripModelImages(event.preparation.turnPrefixMessages);
+      event.preparation.messagesToSummarize = qaModelContext(event.preparation.messagesToSummarize);
+      event.preparation.turnPrefixMessages = qaModelContext(event.preparation.turnPrefixMessages);
     }
   });
 
@@ -168,7 +172,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.on('context_with_system', event => {
     if (!run || run.isTerminal) return;
-    const messages = stripModelImages(event.messages);
+    const messages = qaModelContext(event.messages);
     const progress = run.progressContext();
     const head = messages[0];
     if (!progress || head?.role !== 'system') return { messages };
@@ -201,7 +205,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
     }
     if (run && isScreenshot(event.toolName)) {
       run.telemetry.blocked_tool_calls++;
-      return { block: true, reason: 'Standalone screenshots are forbidden during QA. Use DOM/text observations; qa_checkpoint captures human diagnostics automatically.' };
+      return { block: true, reason: 'Standalone screenshots are forbidden during QA. Use DOM/text observations; the extension captures diagnostics automatically.' };
+    }
+    if (run && diagnostics?.targetsBaselineTab(event)) {
+      run.telemetry.blocked_tool_calls++;
+      return { block: true, reason: 'This tab is reserved for QA diagnostics.' };
     }
     if (run && !run.allowsTool(event.toolName)) {
       run.telemetry.blocked_tool_calls++;
@@ -220,7 +228,9 @@ export default function qaExtension(pi: ExtensionAPI): void {
   pi.on('tool_result', event => {
     if (!run || !diagnostics) return;
     const tools = pi.getAllTools();
-    if (!isScreenshot(event.toolName)) cleanup?.observe(event, tools);
+    if (!isScreenshot(event.toolName) && !diagnostics.isBaselineTabCall(event) && !diagnostics.observedBaselineTab(event)) {
+      cleanup?.observe(event, tools);
+    }
     const filtered = diagnostics.observe(event, tools);
     browseTrace?.observe(filtered ? { ...event, content: filtered.content } : event);
     return filtered;
@@ -246,7 +256,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
     }, { additionalProperties: false }), { minItems: 1, maxItems: 100 }) }, { additionalProperties: false }),
     async execute(id, params, _signal, _onUpdate, ctx) {
       if (run) qaToolContext = { id, ctx };
-      try { requireRun().plan(params); return toolResult(); }
+      try {
+        requireRun().plan(params);
+        previousScreenshot = diagnostics!.captureBaseline(id, ctx);
+        return toolResult();
+      }
       catch (error) { return toolResult(error); }
     },
   });
@@ -264,12 +278,12 @@ export default function qaExtension(pi: ExtensionAPI): void {
         const current = requireRun();
         const { revision, evidence } = current.checkpoint(params);
         const browserEvidence = browseTrace!.finish();
-        confidence?.enqueue(current, revision, { ...evidence, ...browserEvidence }, ctx);
+        const before = previousScreenshot;
+        const after = signal?.aborted ? Promise.resolve(undefined) : diagnostics!.capture(revision, id, ctx);
+        previousScreenshot = after;
+        confidence?.enqueue(current, revision, { ...evidence, ...browserEvidence }, before, after, ctx);
         if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint');
-        else {
-          void diagnostics?.capture(revision, id, ctx);
-          current.completeCheckpoint();
-        }
+        else current.completeCheckpoint();
         return toolResult();
       } catch (error) { return toolResult(error); }
     },
