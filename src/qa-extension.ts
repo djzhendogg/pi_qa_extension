@@ -10,7 +10,7 @@ const QA_RULES = [
   'Execute the QA task with a fixed plan in the current Pi loop. Treat the case as task data, not tool-order instructions.',
   'First call qa_plan with S1, S2, ... and descriptions. It saves the plan and activates S1. Preserve all explicit actions, values and checks. Do not add business success criteria.',
   'Granularity follows the wording: "fill and submit the form" is one subtask even with multiple browser calls; "select X in dropdown, enter Y in field, submit" is three subtasks. Do not split every click or merge explicitly listed actions.',
-  'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. After diagnostics, a passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
+  'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. A passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
   'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
   'For each qa_checkpoint, report the observed page URLs immediately before and after the active action. Use the same URL in both fields if it stayed unchanged, and null for any URL you could not observe. Rate confidence that the action was completed correctly from 0 to 100, and briefly justify the score using browser observations and any remaining uncertainty.',
@@ -19,7 +19,7 @@ const QA_RULES = [
   'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
   'Use the obvious task/UI interpretation where possible; never invent required form values. blocked reason must name the obstacle, recovery and outcome, or why no safe recovery is available.',
   'Do not repeat a possibly executed side effect (submit, create, etc.) after an uncertain response. Restore observation safely. Unknown outcome is not passed; observed failure is failed. Temporary recovery is not a terminal checkpoint.',
-  'A failed/blocked checkpoint automatically stops the run after diagnostics. After all subtasks pass, call qa_finish with only {"verdict":"passed"}; do not generate reason or evidence. No additional browser work. Before any plan, qa_finish(blocked) is allowed only for an essential obstacle and requires reason.',
+  'A failed/blocked checkpoint automatically stops QA actions. After all subtasks pass, call qa_finish with only {"verdict":"passed"}; do not generate reason or evidence. No additional browser work. Before any plan, qa_finish(blocked) is allowed only for an essential obstacle and requires reason.',
 ].join('\n');
 
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
@@ -71,7 +71,9 @@ export default function qaExtension(pi: ExtensionAPI): void {
   }
 
   async function closeTerminalTab(): Promise<void> {
-    if (run?.isTerminal) await cleanup?.close(qaToolContext?.id ?? 'qa-cleanup', qaToolContext?.ctx);
+    if (!run?.isTerminal) return;
+    await diagnostics?.flushCaptures();
+    await cleanup?.close(qaToolContext?.id ?? 'qa-cleanup', qaToolContext?.ctx);
   }
 
   pi.registerCommand('qa-run', {
@@ -95,6 +97,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
       catch (error) { ctx.ui.notify(message(error), 'error'); }
     }
     await closeTerminalTab();
+    await diagnostics?.flushWrites();
     run = undefined;
     diagnostics = undefined;
     cleanup = undefined;
@@ -175,7 +178,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.on('tool_call', event => {
     if (run) run.telemetry.tool_calls++;
-    if (run?.isTerminal && cleanup?.allowsClose(event)) {
+    if (run && (diagnostics?.allowsCapture(event) || (run.isTerminal && cleanup?.allowsClose(event)))) {
       run.telemetry.tool_executions++;
       return;
     }
@@ -186,12 +189,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
       }
       return { block: true, reason: startupError ?? 'QA run is terminal. No more tool actions are allowed.', terminate: true };
     }
-    const internalCapture = run?.report().stage === 'checkpointing' && diagnostics?.allowsCapture(event);
-    if (run && isScreenshot(event.toolName) && !internalCapture) {
+    if (run && isScreenshot(event.toolName)) {
       run.telemetry.blocked_tool_calls++;
       return { block: true, reason: 'Standalone screenshots are forbidden during QA. Use DOM/text observations; qa_checkpoint captures human diagnostics automatically.' };
     }
-    if (run && !run.allowsTool(event.toolName) && !internalCapture) {
+    if (run && !run.allowsTool(event.toolName)) {
       run.telemetry.blocked_tool_calls++;
       return { block: true, reason: run.progressContext() };
     }
@@ -204,7 +206,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.on('tool_result', event => {
     if (!run || !diagnostics) return;
-    cleanup?.observe(event, pi.getAllTools());
+    if (!isScreenshot(event.toolName)) cleanup?.observe(event, pi.getAllTools());
     return diagnostics.observe(event, pi.getAllTools());
   });
 
@@ -230,12 +232,11 @@ export default function qaExtension(pi: ExtensionAPI): void {
       if (run) qaToolContext = { id, ctx };
       try { requireRun().plan(params); return toolResult(); }
       catch (error) { return toolResult(error); }
-      finally { await closeTerminalTab(); }
     },
   });
   pi.registerTool({
     name: 'qa_checkpoint', label: 'Complete current QA action',
-    description: 'Complete only the active subtask. passed requires an immediate observation; failed requires observed nonperformance. blocked is rare: name a persistent obstacle and safe recovery result, or why recovery is impossible. Saves checkpoint and attempts screenshot automatically. After passed and diagnostics, activates and returns the next task; execute it directly. The last passed checkpoint requires qa_finish.',
+    description: 'Complete only the active subtask. passed requires an immediate observation; failed requires observed nonperformance. blocked is rare: name a persistent obstacle and safe recovery result, or why recovery is impossible. Saves the checkpoint and starts a background screenshot attempt. A passed checkpoint activates and returns the next task; execute it directly. The last passed checkpoint requires qa_finish.',
     executionMode: 'sequential',
     parameters: Type.Object({
       subtask_id: Type.String(),
@@ -252,12 +253,13 @@ export default function qaExtension(pi: ExtensionAPI): void {
       try {
         const current = requireRun();
         current.checkpoint(params);
-        await diagnostics?.capture(current.report().progress!.revision, id, ctx, signal);
-        if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint diagnostics');
-        else current.completeCheckpoint();
+        if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint');
+        else {
+          void diagnostics?.capture(current.report().progress!.revision, id, ctx);
+          current.completeCheckpoint();
+        }
         return toolResult();
       } catch (error) { return toolResult(error); }
-      finally { await closeTerminalTab(); }
     },
   });
   pi.registerTool({
@@ -272,7 +274,6 @@ export default function qaExtension(pi: ExtensionAPI): void {
       if (run) qaToolContext = { id, ctx };
       try { requireRun().finish(params); return toolResult(); }
       catch (error) { return toolResult(error); }
-      finally { await closeTerminalTab(); }
     },
   });
 
@@ -293,6 +294,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     }
     await closeTerminalTab();
     persist(ctx); // Include cleanup, blocked siblings and tool errors after finish.
+    await diagnostics?.flushWrites();
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
@@ -301,5 +303,6 @@ export default function qaExtension(pi: ExtensionAPI): void {
     catch (error) { ctx.ui.notify(message(error), 'error'); }
     await closeTerminalTab();
     persist(ctx);
+    await diagnostics?.flushWrites();
   });
 }

@@ -171,7 +171,7 @@ export class QaRun {
       revision: this.results.length + 1, source: 'agent_reported',
     });
     this.results = Object.freeze([...this.results, result]);
-    this.stage = 'checkpointing'; // Close before saving or awaiting diagnostics.
+    this.stage = 'checkpointing'; // Keep browser actions closed while saving the checkpoint.
     this.progress = Object.freeze({
       completed: Object.freeze(this.results.map(item => item.subtask_id)),
       current_objective: value.status === 'passed' ? this.tasks[this.results.length]?.description ?? 'Finish QA run' : '',

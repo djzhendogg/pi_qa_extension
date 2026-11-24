@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { QaDiagnostics, findScreenshotTool, stripModelImages } from '../src/qa-diagnostics.ts';
@@ -8,8 +8,12 @@ export const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8
 const tools = [{ name: 'mcp__browse__screenshot', parameters: { type: 'object', properties: { tab: { type: 'string' }, format: { type: 'string' } }, required: ['tab'] } }];
 function setup(t: TestContext) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
-  t.after(() => { assert.equal(dirname(dir), process.cwd()); rmSync(dir, { recursive: true, force: true }); });
   const diagnostics = new QaDiagnostics(dir, '00000000-0000-4000-8000-000000000001');
+  t.after(async () => {
+    await diagnostics.flushWrites();
+    assert.equal(dirname(dir), process.cwd());
+    rmSync(dir, { recursive: true, force: true });
+  });
   return { dir: join(dir, '00000000-0000-4000-8000-000000000001'), diagnostics };
 }
 
@@ -20,23 +24,28 @@ test('discovers screenshot by live schema and refuses an ambiguous catalog', () 
   assert.equal(findScreenshotTool([{ name: 'screenshot', parameters: { properties: { selector: {} } } }]), undefined);
 });
 
-test('tracks output tab rather than stale execute input; saves and strips checkpoint image', async t => {
+test('uses the observed tab and strips the checkpoint image before its background save', async t => {
   const { dir, diagnostics } = setup(t);
   diagnostics.observe({ toolName: 'mcp__browse__execute', input: { tab: 'old' }, content: [{ type: 'text', text: '{"tab":"new"}' }], isError: false }, tools);
   const calls: unknown[] = [];
+  const imagePath = join(dir, 'checkpoint-001.png');
+  let writtenDuringCapture: boolean | undefined;
   await diagnostics.capture(1, 'checkpoint', {
     tools,
     async executeTool(name, args) {
       calls.push({ name, args });
       const filtered = diagnostics.observe({ toolName: name, input: args, parentToolCallId: 'checkpoint',
         content: [{ type: 'image', mimeType: 'image/png', data: png }], isError: false }, tools);
+      writtenDuringCapture = existsSync(imagePath);
       assert.ok(filtered);
       assert.doesNotMatch(JSON.stringify(filtered), /iVBOR|image\/png/);
       return { isError: false };
     },
   });
   assert.deepEqual(calls, [{ name: 'mcp__browse__screenshot', args: { tab: 'new', format: 'png' } }]);
-  assert.deepEqual(readFileSync(join(dir, 'checkpoint-001.png')), Buffer.from(png, 'base64'));
+  assert.equal(writtenDuringCapture, false);
+  await diagnostics.flushWrites();
+  assert.deepEqual(readFileSync(imagePath), Buffer.from(png, 'base64'));
   assert.equal(readdirSync(dir).filter(name => name.endsWith('.png')).length, 1);
 });
 
@@ -48,6 +57,45 @@ test('capture failure is nonfatal, logged separately, and never retried', async 
   assert.equal(attempts, 1);
   assert.match(readFileSync(join(dir, 'events.jsonl'), 'utf8'), /capture_failed/);
   assert.equal(readdirSync(dir).filter(name => name.endsWith('.png')).length, 0);
+});
+
+test('a late screenshot result cannot replace the current browser tab', async t => {
+  const { diagnostics } = setup(t);
+  diagnostics.observe({ toolName: 'mcp__browse__navigate', input: { tab: 'first' }, content: [], isError: false }, tools);
+  let release!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  const first = diagnostics.capture(1, 'first', {
+    tools,
+    async executeTool(toolName, input) {
+      await wait;
+      diagnostics.observe({ toolName, input, parentToolCallId: 'first', content: [], isError: false }, tools);
+      return { isError: false };
+    },
+  });
+  diagnostics.observe({ toolName: 'mcp__browse__navigate', input: { tab: 'second' }, content: [], isError: false }, tools);
+  release();
+  await first;
+  const tabs: unknown[] = [];
+  await diagnostics.capture(2, 'second', {
+    tools,
+    async executeTool(_name, input) { tabs.push(input.tab); return { isError: false }; },
+  });
+  assert.deepEqual(tabs, ['second']);
+});
+
+test('a failed background write is logged without overwriting an existing image', async t => {
+  const { dir, diagnostics } = setup(t);
+  const imagePath = join(dir, 'tool-001.png');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(imagePath, 'existing image');
+  diagnostics.observe({
+    toolName: 'mcp__browse__execute', input: { tab: 'qa' }, isError: false,
+    content: [{ type: 'image', mimeType: 'image/png', data: png }],
+  }, tools);
+
+  await diagnostics.flushWrites();
+  assert.equal(readFileSync(imagePath, 'utf8'), 'existing image');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'events.jsonl'), 'utf8')).event, 'image_save_failed');
 });
 
 test('unknown target is not guessed and failed or foreign tool calls cannot replace it', async t => {

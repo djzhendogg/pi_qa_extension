@@ -285,21 +285,30 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
   assert.equal(env.requests(), 1); assert.deepEqual(env.extensionErrors, []);
 });
 
-test('next subtask waits for capture; screenshot name cannot bypass gate', async t => {
-  let started!: () => void, release!: () => void;
+test('next subtask runs while capture is pending and model screenshots stay blocked', async t => {
+  let started!: () => void, release!: () => void, nextRequest!: () => void;
   const captured = new Promise<void>(r => { started = r; });
   const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint(), browser('second'), checkpoint('S2'), finish()] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const continued = new Promise<boolean>(r => { nextRequest = () => r(true); });
+  const env = await setup(t, [
+    { calls: [plan(2), navigate(), checkpoint(), browser('second'), screenshot()] },
+    { calls: [checkpoint('S2'), finish()] },
+  ], { screenshots: 'ok', captureStarted: started, captureWait: wait, onRequest: n => { if (n === 2) nextRequest(); } });
   const running = env.run(); await captured;
-  assert.equal(env.reports()[0].stage, 'checkpointing');
-  assert.equal(env.reports()[0].subtask_results.length, 1);
-  assert.deepEqual(env.actions, ['navigate']);
-  const gate = await env.session.extensionRunner.emitToolCall({ type: 'tool_call', toolName: 'mcp__browse__screenshot', toolCallId: 'forged', input: { tab: 'chrome:7' } });
-  assert.equal(gate?.block, true);
-  const nested = await env.session.extensionRunner.emitToolCall({ type: 'tool_call', toolName: 'mcp__browse__screenshot', toolCallId: 'forged/0', parentToolCallId: 'other', input: { tab: 'chrome:7' } });
-  assert.equal(nested?.block, true);
-  release(); await running;
-  assert.deepEqual(env.actions, ['navigate', 'second']); assert.equal(env.screenshotCalls.length, 2);
+  const timeout = new Promise<boolean>(r => AbortSignal.timeout(2000).addEventListener('abort', () => r(false)));
+  try {
+    assert.equal(await Promise.race([continued, timeout]), true, 'QA should continue while screenshot is pending');
+    assert.deepEqual(env.actions, ['navigate', 'second']);
+    const denied = env.session.messages.find(m => m.role === 'toolResult' && m.toolCallId === 'model-shot');
+    assert.ok(denied?.role === 'toolResult' && denied.isError);
+  } finally {
+    release();
+    await running;
+  }
+  assert.equal(env.screenshotCalls.length, 2);
+  const imageDir = join(env.dir, 'qa-diagnostics', env.reports()[0].run_id);
+  assert.ok(existsSync(join(imageDir, 'checkpoint-001.png')));
+  assert.ok(existsSync(join(imageDir, 'checkpoint-002.png')));
 });
 
 test('abort during failed capture preserves accepted verdict', async t => {
@@ -404,9 +413,9 @@ for (const status of ['passed', 'failed', 'blocked'] as const) test(`automatic t
   calls.push(closeCall(), browser('after'));
   const env = await setup(t, [{ calls }], { closeTab: 'ok', screenshots: 'ok', onClose: () => {
     assert.equal(env.reports()[0].execution_status, 'completed');
-    assert.ok(existsSync(join(env.dir, 'qa-diagnostics', env.reports()[0].run_id, 'checkpoint-001.png')));
   } });
   await env.run();
+  assert.ok(existsSync(join(env.dir, 'qa-diagnostics', env.reports()[0].run_id, 'checkpoint-001.png')));
   assert.deepEqual(env.closeCalls, [{ action: 'close', tab: 'chrome:7' }]);
   assert.deepEqual(env.lifecycle, ['screenshot', 'close']);
   assert.deepEqual(env.actions, ['navigate']);
@@ -549,17 +558,19 @@ test('plan and checkpoints return activated tasks without qa_execute_subtask rou
   assert.equal(env.reports()[0].reported_verdict, 'passed');
 });
 
-test('abort during passed checkpoint keeps next subtask gated', async t => {
-  let started!: () => void, release!: () => void;
-  const captured = new Promise<void>(r => { started = r; }); const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint(), browser('must-not-run')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait, closeTab: 'ok' });
-  const running = env.run(); await captured;
-  assert.equal(env.reports()[0].active_subtask_id, 'S1');
-  const gate = await env.session.extensionRunner.emitToolCall({ type: 'tool_call', toolName: 'browser_execute', toolCallId: 'premature', input: { action: 'S2' } });
-  assert.equal(gate?.block, true);
+test('abort with a pending screenshot stops QA and preserves the saved checkpoint', async t => {
+  let started!: () => void, release!: () => void, nextRequest!: () => void;
+  const captured = new Promise<void>(r => { started = r; });
+  const wait = new Promise<void>(r => { release = r; });
+  const continued = new Promise<void>(r => { nextRequest = r; });
+  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint()] }, { waitForAbort: true }], {
+    screenshots: 'ok', captureStarted: started, captureWait: wait, closeTab: 'ok',
+    onRequest: n => { if (n === 2) nextRequest(); },
+  });
+  const running = env.run(); await Promise.all([captured, continued]);
+  assert.equal(env.reports()[0].active_subtask_id, 'S2');
   const aborting = env.session.abort(); release(); await aborting; await running;
   assert.equal(env.reports()[0].execution_status, 'aborted');
-  assert.notEqual(env.reports()[0].active_subtask_id, 'S2');
   assert.equal(env.reports()[0].subtask_results.length, 1);
   assert.deepEqual(env.actions, ['navigate']); assert.equal(env.closeCalls.length, 1);
 });

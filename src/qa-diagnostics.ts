@@ -1,4 +1,5 @@
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 export interface CatalogTool { name: string; parameters: unknown }
@@ -104,7 +105,9 @@ export class QaDiagnostics {
   readonly directory: string;
   private target: { tool: string; tab: string | number } | undefined;
   private imageSequence = 0;
-  private pending = new Map<string, { revision: number; saved: boolean; tool: string }>();
+  private pending = new Map<string, { revision: number; receivedImage: boolean; tool: string; tab: string | number; admitted: boolean }>();
+  private captures = new Set<Promise<void>>();
+  private writes = new Set<Promise<void>>();
 
   constructor(directory: string, runId: string) {
     if (!/^[a-f0-9-]{36}$/i.test(runId)) throw new Error('Invalid diagnostics run id');
@@ -112,9 +115,11 @@ export class QaDiagnostics {
   }
 
   /** Pi supplies parentToolCallId for internal calls; model arguments cannot set it. */
-  allowsCapture(event: { toolName: string; parentToolCallId?: string }): boolean {
-    return event.parentToolCallId !== undefined &&
-      this.pending.get(event.parentToolCallId)?.tool === event.toolName;
+  allowsCapture(event: { toolName: string; parentToolCallId?: string; input: Record<string, unknown> }): boolean {
+    const capture = event.parentToolCallId === undefined ? undefined : this.pending.get(event.parentToolCallId);
+    if (!capture || capture.admitted || capture.tool !== event.toolName || capture.tab !== event.input.tab) return false;
+    capture.admitted = true;
+    return true;
   }
 
   log(event: string, reason: string): void {
@@ -124,9 +129,27 @@ export class QaDiagnostics {
     } catch { /* Diagnostics failures must never fail the QA case. */ }
   }
 
+  async flushWrites(): Promise<void> {
+    await Promise.all(this.writes);
+  }
+
+  async flushCaptures(): Promise<void> {
+    await Promise.all(this.captures);
+  }
+
+  private async saveImage(filename: string, bytes: Buffer): Promise<void> {
+    try {
+      await mkdir(this.directory, { recursive: true });
+      await writeFile(join(this.directory, filename), bytes, { flag: 'wx' });
+    } catch (error) {
+      this.log('image_save_failed', error instanceof Error ? error.message : String(error));
+    }
+  }
+
   observe(event: Observation, tools: readonly CatalogTool[]) {
     const screenshot = findScreenshotTool(tools);
-    if (!event.isError && screenshot && sameNamespace(event.toolName, screenshot.name)) {
+    const screenshotResult = isScreenshot(event.toolName);
+    if (!screenshotResult && !event.isError && screenshot && sameNamespace(event.toolName, screenshot.name)) {
       const action = /(?:^|[_:.-])tabs$/.test(event.toolName) ? event.input.action ?? 'list' : undefined;
       if (action === 'close') {
         if (event.input.tab === this.target?.tab) this.target = undefined;
@@ -136,7 +159,7 @@ export class QaDiagnostics {
       }
     }
     const images = event.content.filter(block => block.type === 'image');
-    const capture = event.parentToolCallId ? this.pending.get(event.parentToolCallId) : undefined;
+    const capture = screenshotResult && event.parentToolCallId ? this.pending.get(event.parentToolCallId) : undefined;
     for (const [index, image] of images.entries()) {
       try {
         const extensions: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
@@ -145,12 +168,13 @@ export class QaDiagnostics {
         const bytes = Buffer.from(image.data, 'base64');
         if (bytes.length === 0 || bytes.length > 32 * 1024 * 1024) throw new Error('Empty or oversized diagnostic image');
         const stem = capture ? `checkpoint-${String(capture.revision).padStart(3, '0')}${index ? `-${index + 1}` : ''}` : `tool-${String(++this.imageSequence).padStart(3, '0')}`;
-        mkdirSync(this.directory, { recursive: true });
-        writeFileSync(join(this.directory, `${stem}.${extension}`), bytes, { flag: 'wx' });
-        if (capture) capture.saved = true;
+        const write = this.saveImage(`${stem}.${extension}`, bytes);
+        this.writes.add(write);
+        void write.then(() => this.writes.delete(write));
+        if (capture) capture.receivedImage = true;
       } catch (error) { this.log('image_save_failed', error instanceof Error ? error.message : String(error)); }
     }
-    if (isScreenshot(event.toolName)) {
+    if (screenshotResult) {
       return { content: [{ type: 'text' as const, text: event.isError ? 'Diagnostic screenshot unavailable.' : 'Screenshot handled for human diagnostics.' }], details: {} };
     }
     const content = event.content.filter(block => block.type === 'text').map(block => ({ type: 'text' as const, text: cleanText(block.text ?? '', images) }));
@@ -162,21 +186,30 @@ export class QaDiagnostics {
     return changed ? { content, details: {} } : undefined;
   }
 
-  async capture(revision: number, parentId: string, ctx: CaptureContext, signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) return;
+  capture(revision: number, parentId: string, ctx: CaptureContext): Promise<void> {
+    const job = this.takeScreenshot(revision, parentId, ctx)
+      .catch(error => this.log('capture_failed', error instanceof Error ? error.message : String(error)));
+    this.captures.add(job);
+    void job.then(() => this.captures.delete(job));
+    return job;
+  }
+
+  private async takeScreenshot(revision: number, parentId: string, ctx: CaptureContext): Promise<void> {
+    if (this.pending.has(parentId)) {
+      this.log('capture_skipped', 'Another screenshot is pending for this tool call ID');
+      return;
+    }
     const screenshot = findScreenshotTool(ctx.tools);
     if (!screenshot || this.target?.tool !== screenshot.name) {
       this.log('capture_skipped', 'No unique Browse screenshot tool with a known tab is available');
       return;
     }
-    const pending = { revision, saved: false, tool: screenshot.name };
+    const pending = { revision, receivedImage: false, tool: screenshot.name, tab: this.target.tab, admitted: false };
     this.pending.set(parentId, pending);
     try {
-      const timeout = AbortSignal.timeout(10_000);
-      const captureSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-      const outcome = await ctx.executeTool(screenshot.name, { tab: this.target.tab, format: 'png' }, { signal: captureSignal });
-      if (outcome.isError || !pending.saved) this.log('capture_failed', 'Browse screenshot failed or returned no inline image');
-    } catch (error) { this.log('capture_failed', error instanceof Error ? error.message : String(error)); }
-    finally { this.pending.delete(parentId); }
+      // Pi aborts the agent loop after a terminal verdict. Diagnostic jobs have their own deadline.
+      const outcome = await ctx.executeTool(screenshot.name, { tab: pending.tab, format: 'png' }, { signal: AbortSignal.timeout(10_000) });
+      if (outcome.isError || !pending.receivedImage) this.log('capture_failed', 'Browse screenshot failed or returned no usable inline image');
+    } finally { this.pending.delete(parentId); }
   }
 }
