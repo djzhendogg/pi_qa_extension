@@ -19,10 +19,8 @@ const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall =
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
 const checkpoint = (id = 'S1', status = 'passed', observation = 'Value visible', reason = '') => call('qa_checkpoint', 'cp-'+id, {
   subtask_id: id, status, observation, reason,
-  confidence_score: status === 'passed' ? 92.5 : 0,
   url_before: 'https://example.com/form',
   url_after: status === 'passed' ? 'https://example.com/result' : null,
-  reasoning: status === 'passed' ? 'The result page shows the saved value.' : reason,
 });
 const success = () => [plan(), browser('work'), checkpoint(), finish()];
 const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
@@ -30,7 +28,7 @@ const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'c
 
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext) => string | Promise<string> } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
   const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
@@ -143,6 +141,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   // Pi performs an auth preflight even with a substituted stream. This is a public,
   // deliberately fake fixture credential; no external API is ever called.
   const contexts: Context[] = [];
+  const confidenceContexts: TranscriptContext[] = [];
   let requests = 0;
   let started!: () => void;
   const whenRequested = new Promise<void>(resolve => { started = resolve; });
@@ -150,8 +149,13 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
     const stream = createAssistantMessageEventStream();
     void (async () => {
       const aborted = streamOptions?.signal?.aborted;
-      const reply = aborted ? { stopReason: 'aborted' as const } : replies[requests];
-      if (!aborted) {
+      const confidence = getCurrentSystemPrompt(context.messages).startsWith('Assess the confidence');
+      const reply = aborted ? { stopReason: 'aborted' as const } : confidence ? undefined : replies[requests];
+      let text = 'Done';
+      if (confidence) {
+        confidenceContexts.push(structuredClone(context));
+        text = await options.assessConfidence?.(context) ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value."}';
+      } else if (!aborted) {
         requests++;
         options.onRequest?.(requests);
         contexts.push(structuredClone(context));
@@ -163,7 +167,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       }
       const stopReason = streamOptions?.signal?.aborted ? 'aborted' : reply?.stopReason ?? (reply?.calls?.length ? 'toolUse' : 'stop');
       const message: AssistantMessage = {
-        role: 'assistant', content: reply?.calls ?? [{ type: 'text', text: 'Done' }],
+        role: 'assistant', content: reply?.calls ?? [{ type: 'text', text }],
         api: model.api, provider: model.provider, model: model.id, stopReason,
         errorMessage: reply?.errorMessage, timestamp: Date.now(),
         usage: { input: reply?.usageInput ?? 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: (reply?.usageInput ?? 20) + 10,
@@ -195,7 +199,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
     rmSync(dir, { recursive: true, force: true });
   });
   return {
-    session, dir, actions, contexts, extensionErrors, whenRequested, screenshotCalls, closeCalls, lifecycle,
+    session, dir, actions, contexts, confidenceContexts, extensionErrors, whenRequested, screenshotCalls, closeCalls, lifecycle,
     requests: () => requests,
     compactions: () => compactions,
     async run() {
@@ -256,6 +260,58 @@ test('QA requests replace Pi coding instructions and retain case, progress, and 
     assert.ok(getCurrentTools(context.messages).some(tool => tool.name === 'browser_execute'));
   }
   assert.match(getCurrentSystemPrompt(env.contexts[2].messages), /"subtask_id":"S1"/);
+});
+
+test('confidence runs outside the QA dialog and updates the original checkpoint', async t => {
+  let release!: () => void, nextRequest!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  const continued = new Promise<void>(resolve => { nextRequest = resolve; });
+  const env = await setup(t, [
+    { calls: [plan(2), browser('first'), checkpoint(), browser('second')] },
+    { calls: [checkpoint('S2', 'passed', 'Second value visible'), finish()] },
+  ], {
+    onRequest: count => { if (count === 2) nextRequest(); },
+    async assessConfidence(context) {
+      await wait;
+      return JSON.stringify({ confidence_score: JSON.stringify(context).includes('Second value visible') ? 60 : 95, reasoning: 'Observed UI state' });
+    },
+  });
+  const running = env.run();
+  try {
+    await Promise.race([continued, running]);
+    assert.deepEqual(env.actions, ['first', 'second']);
+    assert.equal(env.reports()[0].subtask_results[0].confidence_status, 'pending');
+    assert.equal(env.reports()[0].subtask_results[0].confidence_score, null);
+  } finally {
+    release();
+    await running;
+  }
+  assert.equal(env.requests(), 2);
+  assert.equal(env.confidenceContexts.length, 2);
+  const [context] = env.confidenceContexts;
+  assert.deepEqual(getCurrentTools(context.messages), []);
+  const input = context.messages[1];
+  assert.ok(input?.role === 'user' && typeof input.content === 'string');
+  assert.equal(context.messages.length, 2);
+  assert.deepEqual(JSON.parse(input.content), {
+    subtask_id: 'S1', description: 'Action 1', status: 'passed', observation: 'Value visible', reason: '',
+    url_before: 'https://example.com/form', url_after: 'https://example.com/result',
+  });
+  const [report] = env.reports();
+  assert.equal(report.telemetry.llm_calls, 2);
+  assert.deepEqual(report.subtask_results.map((result: { confidence_score: number }) => result.confidence_score), [95, 60]);
+  assert.doesNotMatch(JSON.stringify(env.contexts), /Observed UI state/);
+});
+
+test('an invalid confidence response leaves the QA verdict intact', async t => {
+  const env = await setup(t, [{ calls: success() }], { assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}' });
+  await env.run();
+  const [report] = env.reports();
+  assert.equal(report.reported_verdict, 'passed');
+  const [step] = report.subtask_results;
+  assert.equal(step.confidence_status, 'failed');
+  assert.equal(step.confidence_score, null);
+  assert.equal(step.reasoning, null);
 });
 
 test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs in a mixed packet', async t => {

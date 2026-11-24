@@ -1,6 +1,6 @@
 # Pi QA Goal Guardian
 
-TypeScript extension для Pi: фиксированный план действий, последовательное выполнение, checkpoint и попытка screenshot после каждой подзадачи. Один штатный agent loop, без дополнительных LLM-вызовов extension.
+TypeScript extension для Pi с фиксированным планом QA, последовательными шагами и фоновой диагностикой. Основной agent loop выполняет шаги. Расширение запускает отдельные запросы к модели для оценки уверенности.
 
 Поддерживается **Pi 1.5.2**, Node.js **>=22.19**. Модель и Browse MCP подключаются обычными средствами Pi.
 
@@ -71,14 +71,14 @@ Browse tools должны быть доступны в Pi. При явном о�
 2. После действия модель вызывает:
 
 ```json
-{"subtask_id":"S1","status":"passed","observation":"Открылась страница результата","confidence_score":95,"url_before":"https://example.com/form","url_after":"https://example.com/result","reasoning":"На странице результата появилось подтверждение отправки. Сохранение данных отдельно не проверялось."}
+{"subtask_id":"S1","status":"passed","observation":"Открылась страница результата с подтверждением отправки","url_before":"https://example.com/form","url_after":"https://example.com/result"}
 ```
 
 У `qa_checkpoint` status — passed/failed/blocked. Для passed нужна непустая observation, для failed/blocked — непустая reason; оба поля до 1000 символов. Неправильные аргументы исправимы и не меняют состояние. Дубликат не создаёт новую ревизию или screenshot. Старый контракт с `completed`/`current_objective` больше не принимается: прогресс строится extension из результатов.
 
-Для каждого статуса обязательны `confidence_score` (число от 0 до 100 включительно), `reasoning` (непустое обоснование оценки до 1000 символов), `url_before` и `url_after` (наблюдаемый абсолютный URL до и после действия). Если URL остался прежним, укажите его в обоих полях. Если URL неизвестен, передайте `null` в соответствующем поле.
+Для каждого статуса обязательны `url_before` и `url_after` (наблюдаемые абсолютные URL до и после действия). Если URL остался прежним, укажите его в обоих полях. Если URL неизвестен, передайте `null` в соответствующем поле.
 
-После принятия checkpoint extension сохраняет результат и запускает захват и запись скриншота в фоне. При passed следующая подзадача активируется сразу. Ответ checkpoint содержит её ID, описание и допустимое следующее действие. При failed/blocked QA-действия сразу прекращаются. Снимок может показать страницу уже после следующего действия.
+После принятия checkpoint extension сохраняет результат и запускает фоновую оценку и захват скриншота. При passed следующая подзадача активируется сразу. Ответ checkpoint содержит её ID, описание и допустимое следующее действие. При failed/blocked QA-действия сразу прекращаются. Снимок может показать страницу уже после следующего действия.
 
 3. После всех passed модель вызывает `qa_finish` отдельно:
 
@@ -105,6 +105,12 @@ Browse tools должны быть доступны в Pi. При явном о�
 Исходный сценарий, план, текущий ID и результаты находятся в памяти extension вне истории модели. В системную секцию перед каждым запросом вставляется только стадия, актуальное действие, позиция, последнее observation и следующий допустимый инструмент. Полный план повторно не вставляется; tool responses также компактны. После compaction состояние восстанавливается из extension.
 
 Это не удаляет накопленную историю Browse. Используется штатная compaction Pi, без удаления произвольных tool-call/result пар. Reload/смена сессии завершает незаконченный сценарий как incomplete. Восстановления после перезапуска процесса нет. Extension с принудительным `systemPrompt` может перекрыть структурированные секции Pi и требует адаптации.
+
+## Фоновая оценка уверенности
+
+Расширение использует активную модель Pi и отправляет ей отдельный запрос на каждый принятый checkpoint. Одновременно выполняется один такой запрос на прогон. Контекст состоит из системной инструкции и JSON с полями `subtask_id`, `description` из плана, `status`, `observation`, `reason`, `url_before` и `url_after`. История QA, инструменты и скриншот в запрос не входят.
+
+Модель оценивает, насколько наблюдения подтверждают правильность выполнения шага, и возвращает JSON с `confidence_score` от 0 до 100 и коротким `reasoning`. В отчёте оба поля равны `null`, пока `confidence_status` равен `pending`. При валидном ответе поля заполняются и статус становится `completed`. При ошибке запроса или формата поля остаются `null`, статус становится `failed`, а QA-вердикт сохраняется. Расширение сохраняет терминальный QA-результат до ожидания очереди. При штатном завершении оно дожидается оценок. Для каждого запроса сигнал отмены срабатывает через 15 секунд.
 
 ## Диагностические скриншоты
 
@@ -141,7 +147,7 @@ qa-diagnostics/<run_id>/events.jsonl
 | `execution_status` | running / completed / incomplete / aborted / error |
 | `stage`, `active_subtask_id` | Стадия и активное действие |
 | `plan` | Фиксированные ID и descriptions |
-| `subtask_results` | Результаты шагов с полями status, observation, reason, confidence_score, url_before, url_after, reasoning, revision, source |
+| `subtask_results` | Результаты шагов с полями status, observation, reason, url_before, url_after, confidence_status, confidence_score, reasoning, revision, source |
 | `progress` | Выведенные из результатов completed ID, следующая цель и последнее observation |
 | `reported_verdict`, `verification_status` | Заявление модели; agent_reported при verdict, иначе not_evaluated |
 | `verified_verdict` | Всегда null |
@@ -150,7 +156,7 @@ qa-diagnostics/<run_id>/events.jsonl
 
 Подзадачи plan без результата остаются pending; они не считаются выполненными. revision связывает результат с checkpoint-NNN в отдельной диагностике. Ошибка записи отчёта закрывает gate как error; если каталог недоступен, финальный JSON не гарантируется. Отсутствие отчёта — технический сбой даже при exit code 0 у Pi.
 
-Телеметрия сохраняет llm_calls (before_provider_request, без внутренних transport retries), tool_calls, tool_executions (разрешённые вызовы), tool_errors, blocked_tool_calls и post_finish_attempts. Диагностические вызовы проходят Pi hooks и учитываются. post_success_actions/repeated_side_effects/goal_drift_events равны null: независимого измерения этих показателей нет.
+Телеметрия сохраняет `llm_calls` для запросов основного цикла (before_provider_request без внутренних transport retries) и `confidence_llm_calls` для отдельных запросов оценки. `tool_calls`, `tool_executions`, `tool_errors`, `blocked_tool_calls` и `post_finish_attempts` учитывают вызовы инструментов, включая диагностику скриншотов. post_success_actions/repeated_side_effects/goal_drift_events равны null.
 
 Gate проверяет последовательность, но не истинность observations. `passed` не означает independently verified success. Extension не является sandbox и не отменяет side effects внутри уже запущенного Browse execute. Не запускайте lifecycle tools через параллельный вложенный executor: уже выполняющиеся операции нельзя отозвать. Неожиданное убийство процесса может оставить последний отчёт running.
 

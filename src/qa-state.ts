@@ -16,13 +16,18 @@ export interface SubtaskResult {
   readonly status: Verdict;
   readonly observation: string;
   readonly reason: string;
-  readonly confidence_score: number;
+  readonly confidence_score: number | null;
   readonly url_before: string | null;
   readonly url_after: string | null;
-  readonly reasoning: string;
+  readonly reasoning: string | null;
+  readonly confidence_status: 'pending' | 'completed' | 'failed';
   readonly revision: number;
   readonly source: 'agent_reported';
 }
+export type ConfidenceInput = Pick<SubtaskResult, 'subtask_id' | 'status' | 'observation' | 'reason' | 'url_before' | 'url_after'> & {
+  readonly description: string;
+};
+export interface ConfidenceEstimate { confidence_score: number; reasoning: string }
 export type FinishInput = { verdict: 'passed' } | { verdict: 'failed' | 'blocked'; reason: string };
 interface FinishResult { verdict: Verdict; evidence: string; reason: string }
 export interface ProgressSnapshot {
@@ -95,7 +100,7 @@ export class QaRun {
   private reason = '';
   readonly telemetry = {
     llm_calls: 0, tool_calls: 0, tool_executions: 0, tool_errors: 0,
-    blocked_tool_calls: 0, post_finish_attempts: 0,
+    blocked_tool_calls: 0, post_finish_attempts: 0, confidence_llm_calls: 0,
   };
   constructor(testCase: TestCase, outputDir: string) {
     this.testCase = parseTestCase(testCase);
@@ -148,26 +153,21 @@ export class QaRun {
     this.active = task?.subtask_id ?? null;
     this.stage = task ? 'executing' : 'awaiting_finish';
   }
-  checkpoint(input: unknown): void {
+  checkpoint(input: unknown): { revision: number; evidence: ConfidenceInput } {
     this.requireStage('executing');
     const value = object(input);
-    onlyKeys(value, ['subtask_id', 'status', 'observation', 'reason', 'confidence_score', 'url_before', 'url_after', 'reasoning']);
+    onlyKeys(value, ['subtask_id', 'status', 'observation', 'reason', 'url_before', 'url_after']);
     if (value.subtask_id !== this.active) throw new Error(`Checkpoint requires active subtask ${this.active}`);
     if (!['passed', 'failed', 'blocked'].includes(value.status as string)) throw new Error('Invalid subtask status');
     const observation = optionalText(value.observation, 'observation');
     const reason = optionalText(value.reason, 'reason');
     if (value.status === 'passed') requiredString(observation, 'observation');
     else requiredString(reason, 'reason');
-    const confidence_score = value.confidence_score;
-    if (typeof confidence_score !== 'number' || !Number.isFinite(confidence_score) || confidence_score < 0 || confidence_score > 100) {
-      throw new Error('confidence_score must be a number from 0 to 100');
-    }
     const url_before = checkpointUrl(value.url_before, 'url_before');
     const url_after = checkpointUrl(value.url_after, 'url_after');
-    const reasoning = boundedString(value.reasoning, 'reasoning', 1000);
     const result: SubtaskResult = Object.freeze({
       subtask_id: this.active!, status: value.status as Verdict, observation, reason,
-      confidence_score, url_before, url_after, reasoning,
+      url_before, url_after, confidence_score: null, reasoning: null, confidence_status: 'pending',
       revision: this.results.length + 1, source: 'agent_reported',
     });
     this.results = Object.freeze([...this.results, result]);
@@ -178,6 +178,26 @@ export class QaRun {
       observation, source: 'agent_reported', revision: result.revision,
     });
     this.persist();
+    return {
+      revision: result.revision,
+      evidence: {
+        subtask_id: result.subtask_id, description: this.tasks[result.revision - 1].description,
+        status: result.status, observation, reason, url_before, url_after,
+      },
+    };
+  }
+  recordConfidence(revision: number, estimate?: ConfidenceEstimate): void {
+    const index = revision - 1;
+    const result = this.results[index];
+    if (result?.confidence_status !== 'pending') return;
+    const updated: SubtaskResult = Object.freeze({
+      ...result,
+      confidence_score: estimate?.confidence_score ?? null,
+      reasoning: estimate?.reasoning ?? null,
+      confidence_status: estimate ? 'completed' : 'failed',
+    });
+    this.results = Object.freeze(this.results.with(index, updated));
+    this.writeReport();
   }
   completeCheckpoint(): void {
     if (this.isTerminal) return;
@@ -230,23 +250,29 @@ export class QaRun {
       duration_ms: (this.endedAt ?? Date.now()) - this.startedAt,
       telemetry: {
         ...this.telemetry,
-        llm_calls_source: 'Pi before_provider_request events; excludes retries internal to transport and other extensions',
+        llm_calls_source: 'Pi before_provider_request events; excludes confidence requests, transport retries and other extensions',
         tool_calls_source: 'Pi tool_call events; tool_executions counts allowed calls, not internal Playwright actions',
         post_success_actions: null, repeated_side_effects: null, goal_drift_events: null,
       },
     };
   }
   persist(): void {
+    try { this.writeReport(); }
+    catch (error) {
+      this.status = 'error'; this.stage = 'terminal';
+      this.endedAt ??= Date.now();
+      this.reason = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
+  }
+  private writeReport(): void {
     const temp = `${this.reportPath}.${randomUUID()}.tmp`;
     try {
       mkdirSync(resolve(this.reportPath, '..'), { recursive: true });
       writeFileSync(temp, JSON.stringify(this.report(), null, 2) + '\n', { encoding: 'utf8', flag: 'wx' });
       renameSync(temp, this.reportPath);
     } catch (error) {
-      this.status = 'error'; this.stage = 'terminal';
-      this.endedAt ??= Date.now();
-      this.reason = `Could not save QA report: ${error instanceof Error ? error.message : String(error)}`;
-      throw new Error(this.reason, { cause: error });
+      throw new Error(`Could not save QA report: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     } finally { try { rmSync(temp, { force: true }); } catch { /* best effort */ } }
   }
 }

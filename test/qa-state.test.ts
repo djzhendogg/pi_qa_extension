@@ -18,10 +18,8 @@ function planned(t: TestContext) {
 }
 const result = (subtask_id = 'S1', status = 'passed', observation = 'Selected value visible', reason = '') => ({
   subtask_id, status, observation, reason,
-  confidence_score: observation ? 100 : 0,
   url_before: null,
   url_after: observation ? fixture.url : null,
-  reasoning: observation || reason,
 });
 const finish = { verdict: 'passed' };
 
@@ -113,23 +111,21 @@ test('invalid checkpoint does not mutate active task or revision', t => {
   assert.equal(run.report().progress?.revision, 1);
 });
 
-test('checkpoint metadata is required and invalid values leave the step retryable', t => {
+test('checkpoint URLs are required and invalid values leave the step retryable', t => {
   const run = planned(t);
   for (const [field, values] of Object.entries({
-    confidence_score: [undefined, -1, 101, NaN, Infinity, '90'],
     url_before: [undefined, '', '/form'],
     url_after: [undefined, 42, 'invalid url'],
-    reasoning: [undefined, ' ', 'x'.repeat(1001)],
   })) {
     for (const value of values) {
       assert.throws(() => run.checkpoint({ ...result(), [field]: value }), new RegExp(field));
     }
   }
   assert.equal(run.report().subtask_results.length, 0);
-  run.checkpoint({ ...result(), confidence_score: 0, url_before: 'about:blank', url_after: null });
+  run.checkpoint({ ...result(), url_before: 'about:blank', url_after: null });
   run.completeCheckpoint();
   run.checkpoint(result('S2'));
-  assert.deepEqual(run.report().subtask_results.map(item => item.confidence_score), [0, 100]);
+  assert.deepEqual(run.report().subtask_results.map(item => item.confidence_score), [null, null]);
 });
 
 test('only blocked emergency finish is available before plan', t => {

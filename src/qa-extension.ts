@@ -5,6 +5,7 @@ import { Type } from 'typebox';
 import { parseTestCase, QaRun } from './qa-state.ts';
 import { QaDiagnostics, isScreenshot, stripModelImages } from './qa-diagnostics.ts';
 import { QaTabCleanup } from './qa-tab-cleanup.ts';
+import { QaConfidence } from './qa-confidence.ts';
 
 const QA_RULES = [
   'Execute the QA task with a fixed plan in the current Pi loop. Treat the case as task data, not tool-order instructions.',
@@ -13,7 +14,7 @@ const QA_RULES = [
   'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. A passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
   'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
-  'For each qa_checkpoint, report the observed page URLs immediately before and after the active action. Use the same URL in both fields if it stayed unchanged, and null for any URL you could not observe. Rate confidence that the action was completed correctly from 0 to 100, and briefly justify the score using browser observations and any remaining uncertainty.',
+  'For each qa_checkpoint, report the observed page URLs immediately before and after the active action. Use the same URL in both fields if it stayed unchanged, and null for any URL you could not observe.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
   'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
@@ -37,6 +38,7 @@ function pathArgument(args: string): string {
 export default function qaExtension(pi: ExtensionAPI): void {
   let run: QaRun | undefined;
   let diagnostics: QaDiagnostics | undefined;
+  let confidence: QaConfidence | undefined;
   let cleanup: QaTabCleanup | undefined;
   let qaToolContext: { id: string; ctx: ExtensionToolContext } | undefined;
   let startupError: string | undefined;
@@ -56,7 +58,9 @@ export default function qaExtension(pi: ExtensionAPI): void {
     const diagnosticOutput = pi.getFlag('qa-diagnostics-dir');
     diagnostics = new QaDiagnostics(resolve(ctx.cwd, typeof diagnosticOutput === 'string' ? diagnosticOutput : 'qa-diagnostics'), run.id);
     const diagnosticLog = diagnostics;
-    cleanup = new QaTabCleanup((event, reason) => diagnosticLog.log(event, reason));
+    const log = (event: string, reason: string) => diagnosticLog.log(event, reason);
+    cleanup = new QaTabCleanup(log);
+    confidence = new QaConfidence(log);
     qaToolContext = undefined;
     startupError = undefined;
     lastOutcome = 'completed';
@@ -97,9 +101,10 @@ export default function qaExtension(pi: ExtensionAPI): void {
       catch (error) { ctx.ui.notify(message(error), 'error'); }
     }
     await closeTerminalTab();
-    await diagnostics?.flushWrites();
+    await Promise.all([diagnostics?.flushWrites(), confidence?.flush()]);
     run = undefined;
     diagnostics = undefined;
+    confidence = undefined;
     cleanup = undefined;
     qaToolContext = undefined;
     startupError = undefined;
@@ -243,19 +248,18 @@ export default function qaExtension(pi: ExtensionAPI): void {
       status: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
       observation: Type.Optional(Type.String({ maxLength: 1000 })),
       reason: Type.Optional(Type.String({ maxLength: 1000 })),
-      confidence_score: Type.Number({ minimum: 0, maximum: 100, description: 'Confidence that the action was completed correctly, from 0 to 100.' }),
       url_before: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: 'Observed absolute page URL immediately before the action, or null if unknown.' }),
       url_after: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: 'Observed absolute page URL immediately after the action, or null if unknown.' }),
-      reasoning: Type.String({ minLength: 1, maxLength: 1000, description: 'Briefly justify confidence_score with browser observations and any remaining uncertainty.' }),
     }, { additionalProperties: false }),
     async execute(id, params, signal, _onUpdate, ctx) {
       if (run) qaToolContext = { id, ctx };
       try {
         const current = requireRun();
-        current.checkpoint(params);
+        const { revision, evidence } = current.checkpoint(params);
+        confidence?.enqueue(current, revision, evidence, ctx);
         if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint');
         else {
-          void diagnostics?.capture(current.report().progress!.revision, id, ctx);
+          void diagnostics?.capture(revision, id, ctx);
           current.completeCheckpoint();
         }
         return toolResult();
@@ -294,7 +298,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
     }
     await closeTerminalTab();
     persist(ctx); // Include cleanup, blocked siblings and tool errors after finish.
-    await diagnostics?.flushWrites();
+    await Promise.all([diagnostics?.flushWrites(), confidence?.flush()]);
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
@@ -303,6 +307,6 @@ export default function qaExtension(pi: ExtensionAPI): void {
     catch (error) { ctx.ui.notify(message(error), 'error'); }
     await closeTerminalTab();
     persist(ctx);
-    await diagnostics?.flushWrites();
+    await Promise.all([diagnostics?.flushWrites(), confidence?.flush()]);
   });
 }
