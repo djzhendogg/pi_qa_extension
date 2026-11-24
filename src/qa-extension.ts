@@ -15,12 +15,12 @@ const QA_RULES = [
   'Execute the active saved action using browser tools, then call qa_checkpoint for its ID. A passed checkpoint activates and returns the next action automatically. Continue with that action; no separate activation call is needed. Never rewrite the plan.',
   'Use DOM and text observations. Standalone screenshot calls are forbidden during QA. Screenshots are human-only diagnostics captured automatically by qa_checkpoint; do not call screenshot directly or through another tool.',
   'Use the latest browser result to confirm the current action. Do not recheck previous work without an explicit task requirement or concrete contradictory state. No invented final checks.',
-  'When you already read DOM inside Browse execute, return the snapshot in dom_before or dom_after as appropriate. Keep the observed result in the same call. Do not add a browser call just for the confidence assessment.',
-  'For each qa_checkpoint, report the observed page URLs immediately before and after the active action. Use the same URL in both fields if it stayed unchanged, and null for any URL you could not observe.',
+  'When you already read DOM or the page URL inside Browse execute, return the observed snapshot or URL in that call. Use dom_before, dom_after, or url as appropriate. Do not add a browser call just for diagnostics.',
+  'Call qa_checkpoint with only the active subtask_id and status. Background diagnostics use the existing Browse results to fill in observations, reasons, and URLs.',
   'passed needs an observed immediate result, not just absence of a tool error. failed means observed nonperformance of the requested action/check.',
   'blocked is a rare last resort for a concrete persistent obstacle, missing essential data/access, or required external intervention. A loading page, closed dropdown, offscreen element, stale locator, ambiguity, or a single tool error is not immediately blocked.',
   'For a fixable obstacle perform one appropriate safe recovery (short wait, scroll, open control, refresh locator or restore browser observation), then assess the result. Do not loop without new evidence. Missing credentials or CAPTCHA need no futile recovery.',
-  'Use the obvious task/UI interpretation where possible; never invent required form values. blocked reason must name the obstacle, recovery and outcome, or why no safe recovery is available.',
+  'Use the obvious task/UI interpretation where possible; never invent required form values. Before marking blocked, identify the obstacle and whether a safe recovery is available.',
   'Do not repeat a possibly executed side effect (submit, create, etc.) after an uncertain response. Restore observation safely. Unknown outcome is not passed; observed failure is failed. Temporary recovery is not a terminal checkpoint.',
   'A failed/blocked checkpoint automatically stops QA actions. After all subtasks pass, call qa_finish with only {"verdict":"passed"}; do not generate reason or evidence. No additional browser work. Before any plan, qa_finish(blocked) is allowed only for an essential obstacle and requires reason.',
 ].join('\n');
@@ -252,22 +252,18 @@ export default function qaExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: 'qa_checkpoint', label: 'Complete current QA action',
-    description: 'Complete only the active subtask. passed requires an immediate observation; failed requires observed nonperformance. blocked is rare: name a persistent obstacle and safe recovery result, or why recovery is impossible. Saves the checkpoint and starts a background screenshot attempt. A passed checkpoint activates and returns the next task; execute it directly. The last passed checkpoint requires qa_finish.',
+    description: 'Report the status of the active subtask. Use passed for observed success, failed for observed nonperformance, or blocked for a persistent obstacle. A passed checkpoint immediately activates and returns the next task. The last passed checkpoint requires qa_finish. Diagnostics run in the background.',
     executionMode: 'sequential',
     parameters: Type.Object({
       subtask_id: Type.String(),
       status: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('blocked')]),
-      observation: Type.Optional(Type.String({ maxLength: 1000 })),
-      reason: Type.Optional(Type.String({ maxLength: 1000 })),
-      url_before: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: 'Observed absolute page URL immediately before the action, or null if unknown.' }),
-      url_after: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: 'Observed absolute page URL immediately after the action, or null if unknown.' }),
     }, { additionalProperties: false }),
     async execute(id, params, signal, _onUpdate, ctx) {
       if (run) qaToolContext = { id, ctx };
       try {
         const current = requireRun();
         const { revision, evidence } = current.checkpoint(params);
-        const browserEvidence = browseTrace!.finish(evidence.url_before, evidence.url_after);
+        const browserEvidence = browseTrace!.finish();
         confidence?.enqueue(current, revision, { ...evidence, ...browserEvidence }, ctx);
         if (signal?.aborted) current.end('aborted', 'User aborted during checkpoint');
         else {

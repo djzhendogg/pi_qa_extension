@@ -14,8 +14,8 @@ export interface Subtask { readonly subtask_id: string; readonly description: st
 export interface SubtaskResult {
   readonly subtask_id: string;
   readonly status: Verdict;
-  readonly observation: string;
-  readonly reason: string;
+  readonly observation: string | null;
+  readonly reason: string | null;
   readonly confidence_score: number | null;
   readonly url_before: string | null;
   readonly url_after: string | null;
@@ -24,16 +24,16 @@ export interface SubtaskResult {
   readonly revision: number;
   readonly source: 'agent_reported';
 }
-export type ConfidenceInput = Pick<SubtaskResult, 'subtask_id' | 'status' | 'observation' | 'reason' | 'url_before' | 'url_after'> & {
+export type ConfidenceInput = Pick<SubtaskResult, 'subtask_id' | 'status'> & {
   readonly description: string;
 };
-export interface ConfidenceEstimate { confidence_score: number; reasoning: string }
+export type ConfidenceEstimate = Pick<SubtaskResult, 'observation' | 'reason'> & { confidence_score: number; reasoning: string };
+export type ObservedUrls = Pick<SubtaskResult, 'url_before' | 'url_after'>;
 export type FinishInput = { verdict: 'passed' } | { verdict: 'failed' | 'blocked'; reason: string };
-interface FinishResult { verdict: Verdict; evidence: string; reason: string }
 export interface ProgressSnapshot {
   readonly completed: readonly string[];
   readonly current_objective: string;
-  readonly observation: string;
+  readonly observation: string | null;
   readonly source: 'agent_reported';
   readonly revision: number;
 }
@@ -52,16 +52,6 @@ function boundedString(value: unknown, field: string, maximum: number): string {
   const text = requiredString(value, field);
   if (text.length > maximum) throw new Error(`${field} must be at most ${maximum} characters`);
   return text;
-}
-function optionalText(value: unknown, field: string): string {
-  if (value === undefined) return '';
-  if (typeof value !== 'string' || value.length > 1000) throw new Error(`${field} must be a string of at most 1000 characters`);
-  return value;
-}
-function checkpointUrl(value: unknown, field: string): string | null {
-  if (value === null) return null;
-  if (typeof value !== 'string' || !URL.canParse(value)) throw new Error(`${field} must be an absolute URL or null`);
-  return value;
 }
 export function parseTestCase(input: unknown): TestCase {
   const value = object(input);
@@ -95,7 +85,7 @@ export class QaRun {
   private tasks: readonly Subtask[] = Object.freeze([]);
   private results: readonly SubtaskResult[] = Object.freeze([]);
   private active: string | null = null;
-  private finishInput: FinishResult | null = null;
+  private verdict: Verdict | null = null;
   private progress: ProgressSnapshot | null = null;
   private reason = '';
   readonly telemetry = {
@@ -112,7 +102,7 @@ export class QaRun {
   progressContext(): string {
     if (this.isTerminal) return `QA CURRENT STATE (agent_reported):\n${JSON.stringify({
       stage: 'terminal', execution_status: this.status,
-      reported_verdict: this.finishInput?.verdict ?? null, reason: this.reason, next: 'stop',
+      reported_verdict: this.verdict, reason: this.reason, next: 'stop',
     })}`;
     const index = this.stage === 'checkpointing' ? this.results.length - 1 : this.results.length;
     const task = this.tasks[index];
@@ -121,7 +111,6 @@ export class QaRun {
       stage: this.stage, subtask_id: task?.subtask_id ?? null,
       position: task ? `${index + 1}/${this.tasks.length}` : `${this.results.length}/${this.tasks.length}`,
       description: task?.description ?? '',
-      last_observation: this.results.at(-1)?.observation ?? '',
       next,
     })}`;
   }
@@ -156,18 +145,12 @@ export class QaRun {
   checkpoint(input: unknown): { revision: number; evidence: ConfidenceInput } {
     this.requireStage('executing');
     const value = object(input);
-    onlyKeys(value, ['subtask_id', 'status', 'observation', 'reason', 'url_before', 'url_after']);
+    onlyKeys(value, ['subtask_id', 'status']);
     if (value.subtask_id !== this.active) throw new Error(`Checkpoint requires active subtask ${this.active}`);
     if (!['passed', 'failed', 'blocked'].includes(value.status as string)) throw new Error('Invalid subtask status');
-    const observation = optionalText(value.observation, 'observation');
-    const reason = optionalText(value.reason, 'reason');
-    if (value.status === 'passed') requiredString(observation, 'observation');
-    else requiredString(reason, 'reason');
-    const url_before = checkpointUrl(value.url_before, 'url_before');
-    const url_after = checkpointUrl(value.url_after, 'url_after');
     const result: SubtaskResult = Object.freeze({
-      subtask_id: this.active!, status: value.status as Verdict, observation, reason,
-      url_before, url_after, confidence_score: null, reasoning: null, confidence_status: 'pending',
+      subtask_id: this.active!, status: value.status as Verdict, observation: null, reason: null,
+      url_before: null, url_after: null, confidence_score: null, reasoning: null, confidence_status: 'pending',
       revision: this.results.length + 1, source: 'agent_reported',
     });
     this.results = Object.freeze([...this.results, result]);
@@ -175,28 +158,34 @@ export class QaRun {
     this.progress = Object.freeze({
       completed: Object.freeze(this.results.map(item => item.subtask_id)),
       current_objective: value.status === 'passed' ? this.tasks[this.results.length]?.description ?? 'Finish QA run' : '',
-      observation, source: 'agent_reported', revision: result.revision,
+      observation: null, source: 'agent_reported', revision: result.revision,
     });
     this.persist();
     return {
       revision: result.revision,
       evidence: {
         subtask_id: result.subtask_id, description: this.tasks[result.revision - 1].description,
-        status: result.status, observation, reason, url_before, url_after,
+        status: result.status,
       },
     };
   }
-  recordConfidence(revision: number, estimate?: ConfidenceEstimate): void {
+  recordConfidence(revision: number, urls: ObservedUrls, estimate?: ConfidenceEstimate): void {
     const index = revision - 1;
     const result = this.results[index];
     if (result?.confidence_status !== 'pending') return;
     const updated: SubtaskResult = Object.freeze({
       ...result,
+      ...urls,
+      observation: estimate?.observation ?? null,
+      reason: result.status === 'passed' ? null : estimate?.reason ?? null,
       confidence_score: estimate?.confidence_score ?? null,
       reasoning: estimate?.reasoning ?? null,
       confidence_status: estimate ? 'completed' : 'failed',
     });
     this.results = Object.freeze(this.results.with(index, updated));
+    if (this.progress?.revision === revision) {
+      this.progress = Object.freeze({ ...this.progress, observation: updated.observation });
+    }
     this.writeReport();
   }
   completeCheckpoint(): void {
@@ -205,7 +194,7 @@ export class QaRun {
     const result = this.results.at(-1)!;
     this.active = null;
     if (result.status !== 'passed') {
-      this.complete({ verdict: result.status, evidence: this.aggregateEvidence(), reason: result.reason });
+      this.complete(result.status);
     } else {
       this.activateNextSubtask();
       this.persist();
@@ -217,15 +206,15 @@ export class QaRun {
   finish(input: unknown): void {
     if (this.isTerminal) return;
     const finish = parseFinish(input);
-    if (this.stage === 'planning' && finish.verdict === 'blocked') { this.complete({ ...finish, evidence: '' }); return; }
+    if (this.stage === 'planning' && finish.verdict === 'blocked') { this.complete(finish.verdict, finish.reason); return; }
     this.requireStage('awaiting_finish');
     if (finish.verdict !== 'passed') throw new Error('All subtasks passed; finish must use passed');
-    this.complete({ verdict: 'passed', evidence: this.aggregateEvidence(), reason: '' });
+    this.complete('passed');
   }
-  private complete(finish: FinishResult): void {
-    this.finishInput = Object.freeze(finish);
+  private complete(verdict: Verdict, reason = ''): void {
+    this.verdict = verdict;
     this.status = 'completed'; this.stage = 'terminal'; this.active = null;
-    this.reason = finish.reason; this.endedAt = Date.now();
+    this.reason = reason; this.endedAt = Date.now();
     this.persist();
   }
   end(status: Exclude<ExecutionStatus, 'running' | 'completed'>, reason: string): void {
@@ -243,9 +232,10 @@ export class QaRun {
       schema_version: 2, run_id: this.id, scenario_id: this.testCase.scenario_id, test_case: this.testCase,
       execution_status: this.status, stage: this.stage, active_subtask_id: this.active,
       plan: this.tasks, subtask_results: this.results,
-      reported_verdict: this.finishInput?.verdict ?? null,
-      verification_status: this.finishInput ? 'agent_reported' : 'not_evaluated', verified_verdict: null,
-      progress: this.progress, evidence: this.finishInput?.evidence ?? '', reason: this.reason,
+      reported_verdict: this.verdict,
+      verification_status: this.verdict ? 'agent_reported' : 'not_evaluated', verified_verdict: null,
+      progress: this.progress, evidence: this.verdict ? this.aggregateEvidence() : '',
+      reason: this.reason || (this.verdict && this.verdict !== 'passed' ? this.results.at(-1)?.reason ?? '' : ''),
       started_at: new Date(this.startedAt).toISOString(), ended_at: this.endedAt === null ? null : new Date(this.endedAt).toISOString(),
       duration_ms: (this.endedAt ?? Date.now()) - this.startedAt,
       telemetry: {

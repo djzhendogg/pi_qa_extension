@@ -8,21 +8,33 @@ const prompt = [
   'Read browse_trace in call order, including errors and recoveries. Compare dom_before and dom_after when present. A null DOM field means the browser did not supply a suitable snapshot.',
   'The reported status is a claim. A passed status alone is insufficient. Use a lower score when evidence is missing, indirect or contradictory.',
   'Use the URLs only as supporting evidence. Identify the strongest observation and any material uncertainty. Do not add requirements or change the reported status.',
-  'Return only JSON with confidence_score (a number from 0 to 100) and reasoning (one or two concise sentences in the language of the step).',
+  'Return only JSON with observation, reason, confidence_score, and reasoning. observation is a brief factual summary of what the browser showed, or null if unknown. reason is the evidenced cause for failed or blocked, or null if passed or the cause is unknown. Keep observation and reason under 1000 characters.',
+  'confidence_score is a number from 0 to 100. reasoning is one or two concise sentences in the language of the step.',
 ].join('\n');
+
+function diagnosticText(value: unknown, field: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !value.trim() || value.length > 1000) {
+    throw new Error(`${field} must be null or nonempty text of at most 1000 characters`);
+  }
+  return value.trim();
+}
 
 function parseEstimate(text: string): ConfidenceEstimate {
   const fenced = /^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$/i.exec(text);
   const value: unknown = JSON.parse(fenced?.[1] ?? text);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected a confidence JSON object');
-  const { confidence_score, reasoning } = value as Record<string, unknown>;
+  const { confidence_score, reasoning, observation, reason } = value as Record<string, unknown>;
   if (typeof confidence_score !== 'number' || !Number.isFinite(confidence_score) || confidence_score < 0 || confidence_score > 100) {
     throw new Error('confidence_score must be a number from 0 to 100');
   }
   if (typeof reasoning !== 'string' || !reasoning.trim() || reasoning.length > 1000) {
     throw new Error('reasoning must be nonempty and at most 1000 characters');
   }
-  return { confidence_score, reasoning: reasoning.trim() };
+  return {
+    confidence_score, reasoning: reasoning.trim(),
+    observation: diagnosticText(observation, 'observation'), reason: diagnosticText(reason, 'reason'),
+  };
 }
 
 /** One direct model request at a time for this QA run. */
@@ -60,7 +72,8 @@ export class QaConfidence {
           }
         }
       }
-      try { run.recordConfidence(revision, estimate); }
+      const { url_before, url_after } = evidence;
+      try { run.recordConfidence(revision, { url_before, url_after }, estimate); }
       catch (error) { this.log('confidence_save_failed', String(error)); }
     });
   }

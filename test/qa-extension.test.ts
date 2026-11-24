@@ -17,11 +17,7 @@ const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_f
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
-const checkpoint = (id = 'S1', status = 'passed', observation = 'Value visible', reason = '') => call('qa_checkpoint', 'cp-'+id, {
-  subtask_id: id, status, observation, reason,
-  url_before: 'https://example.com/form',
-  url_after: status === 'passed' ? 'https://example.com/result' : null,
-});
+const checkpoint = (id = 'S1', status = 'passed') => call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status });
 const success = () => [plan(), browser('work'), checkpoint(), finish()];
 const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
 const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
@@ -185,7 +181,8 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
       let confidenceStop: 'error' | 'length' | undefined;
       if (confidence) {
         confidenceContexts.push(structuredClone(context));
-        const answer = await options.assessConfidence?.(context, streamOptions) ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value."}';
+        const answer = await options.assessConfidence?.(context, streamOptions)
+          ?? '{"confidence_score":92.5,"reasoning":"The result page shows the saved value.","observation":"Value visible","reason":null}';
         text = typeof answer === 'string' ? answer : answer.text;
         confidenceStop = typeof answer === 'string' ? undefined : answer.stopReason;
       } else if (!aborted) {
@@ -268,8 +265,8 @@ for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: 
     const { confidence_score, url_before, url_after, reasoning } = report.subtask_results[0];
     assert.deepEqual({ confidence_score, url_before, url_after, reasoning }, {
       confidence_score: 92.5,
-      url_before: 'https://example.com/form',
-      url_after: 'https://example.com/result',
+      url_before: null,
+      url_after: null,
       reasoning: 'The result page shows the saved value.',
     });
     assert.equal(report.progress.revision, 1);
@@ -301,12 +298,15 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   const continued = new Promise<void>(resolve => { nextRequest = resolve; });
   const env = await setup(t, [
     { calls: [plan(2), browser('first'), checkpoint(), browser('second')] },
-    { calls: [checkpoint('S2', 'passed', 'Second value visible'), finish()] },
+    { calls: [checkpoint('S2'), finish()] },
   ], {
     onRequest: count => { if (count === 2) nextRequest(); },
     async assessConfidence(context) {
       await wait;
-      return JSON.stringify({ confidence_score: JSON.stringify(context).includes('Second value visible') ? 60 : 95, reasoning: 'Observed UI state' });
+      return JSON.stringify({
+        confidence_score: JSON.stringify(context).includes('Action 2') ? 60 : 95,
+        reasoning: 'Observed UI state', observation: 'Value visible', reason: null,
+      });
     },
   });
   const running = env.run();
@@ -327,8 +327,7 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   assert.ok(input?.role === 'user' && typeof input.content === 'string');
   assert.equal(context.messages.length, 2);
   assert.deepEqual(JSON.parse(input.content), {
-    subtask_id: 'S1', description: 'Action 1', status: 'passed', observation: 'Value visible', reason: '',
-    url_before: 'https://example.com/form', url_after: 'https://example.com/result',
+    subtask_id: 'S1', description: 'Action 1', status: 'passed', url_before: null, url_after: null,
     browse_trace: [{ tool: 'browser_execute', input: { action: 'first' }, status: 'ok', result: 'Observed page' }],
     dom_before: null, dom_after: null,
   });
@@ -343,14 +342,10 @@ test('confidence receives the step Browse trace and only fresh DOM observations'
   const url = 'https://example.com/form';
   const shot = (id: string) => call('mcp__browse__snapshot', id, { tab });
   const click = (id: string, ref: string) => call('mcp__browse__click', id, { tab, ref });
-  const step = (id: string) => {
-    const tool = checkpoint(id);
-    return { ...tool, arguments: { ...tool.arguments, url_before: url, url_after: url } };
-  };
   const env = await setup(t, [{ calls: [
-    plan(3), shot('before'), click('error', 'stale'), click('click', 'e12'), shot('after'), step('S1'),
-    call('mcp__browse__execute', 'execute', { tab, code: 'await ref("e12").click(); return { dom_after: await snapshot() };' }), step('S2'),
-    click('unobserved', 'e12'), step('S3'), finish(),
+    plan(3), shot('before'), click('error', 'stale'), click('click', 'e12'), shot('after'), checkpoint('S1'),
+    call('mcp__browse__execute', 'execute', { tab, code: 'await ref("e12").click(); return { dom_after: await snapshot() };' }), checkpoint('S2'),
+    click('unobserved', 'e12'), checkpoint('S3'), finish(),
   ] }], { browseEvidence: true });
   await env.run();
   const inputs = env.confidenceContexts.map(context => {
@@ -373,6 +368,10 @@ test('confidence receives the step Browse trace and only fresh DOM observations'
   assert.equal(third.browse_trace.length, 1);
   assert.deepEqual(third.dom_before, second.dom_after);
   assert.equal(third.dom_after, null);
+  const [report] = env.reports();
+  assert.deepEqual(report.subtask_results.map((step: { url_before: string | null; url_after: string | null }) => [step.url_before, step.url_after]), [
+    [url, url], [url, url], [url, null],
+  ]);
 });
 
 for (const [failure, firstAnswer] of [
@@ -384,7 +383,7 @@ for (const [failure, firstAnswer] of [
   const env = await setup(t, [{ calls: success() }], {
     assessConfidence(_context, options) {
       attempts.push(options);
-      return attempts.length === 1 ? firstAnswer : '{"confidence_score":96,"reasoning":"The page confirms success."}';
+      return attempts.length === 1 ? firstAnswer : '{"confidence_score":96,"reasoning":"The page confirms success.","observation":"Saved","reason":null}';
     },
   });
   await env.run();
@@ -403,7 +402,10 @@ for (const [failure, firstAnswer] of [
 });
 
 test('two invalid confidence responses leave the QA verdict intact', async t => {
-  const env = await setup(t, [{ calls: success() }], { assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}' });
+  const snapshot = call('mcp__browse__snapshot', 'snapshot', { tab: 'chrome:7' });
+  const env = await setup(t, [{ calls: [plan(), snapshot, checkpoint(), finish()] }], {
+    browseEvidence: true, assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}',
+  });
   await env.run();
   const [report] = env.reports();
   assert.equal(report.reported_verdict, 'passed');
@@ -412,6 +414,10 @@ test('two invalid confidence responses leave the QA verdict intact', async t => 
   assert.equal(step.confidence_status, 'failed');
   assert.equal(step.confidence_score, null);
   assert.equal(step.reasoning, null);
+  assert.equal(step.observation, null);
+  assert.equal(step.reason, null);
+  assert.equal(step.url_before, 'https://example.com/form');
+  assert.equal(step.url_after, 'https://example.com/form');
 });
 
 test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs in a mixed packet', async t => {
@@ -424,18 +430,23 @@ test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs 
 });
 
 test('invalid checkpoint stays recoverable and duplicate cannot add a revision', async t => {
-  const env = await setup(t, [{ calls: [plan(), checkpoint('S1', 'passed', ' '), browser('recover'), checkpoint(), checkpoint(), finish()] }]);
+  const env = await setup(t, [{ calls: [plan(), checkpoint('S1', 'invalid'), browser('recover'), checkpoint(), checkpoint(), finish()] }]);
   await env.run(); assert.deepEqual(env.actions, ['recover']);
   assert.equal(env.reports()[0].subtask_results.length, 1);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
 });
 
 for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint captures once and stops later siblings`, async t => {
-  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint('S1', status, '', 'Missing credentials; no safe recovery available'), screenshot(), browser('after')] }], { screenshots: 'ok' });
+  const env = await setup(t, [{ calls: [plan(2), navigate(), checkpoint('S1', status), screenshot(), browser('after')] }], {
+    screenshots: 'ok',
+    assessConfidence: () => '{"confidence_score":10,"reasoning":"Access failed.","observation":null,"reason":"Required access unavailable."}',
+  });
   await env.run(); assert.deepEqual(env.actions, ['navigate']);
   assert.equal(env.screenshotCalls.length, 1);
   const [report] = env.reports();
   assert.equal(report.reported_verdict, status);
+  assert.equal(report.reason, 'Required access unavailable.');
+  assert.equal(report.subtask_results[0].reason, report.reason);
   assert.equal(report.subtask_results.length, 1);
   assert.ok(existsSync(join(env.dir, 'qa-diagnostics', report.run_id, 'checkpoint-001.png')));
   assert.equal(env.requests(), 1); assert.deepEqual(env.extensionErrors, []);
@@ -471,7 +482,7 @@ test('abort during failed capture preserves accepted verdict', async t => {
   let started!: () => void, release!: () => void;
   const captured = new Promise<void>(r => { started = r; });
   const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'failed', '', 'Value did not change'), browser('after')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'failed'), browser('after')] }], { screenshots: 'ok', captureStarted: started, captureWait: wait });
   const running = env.run(); await captured;
   const aborting = env.session.abort(); release(); await aborting; await running;
   assert.equal(env.reports()[0].reported_verdict, 'failed');
@@ -480,7 +491,7 @@ test('abort during failed capture preserves accepted verdict', async t => {
 });
 
 for (const screenshots of ['ok', 'error', 'bad-storage'] as const) test(`diagnostics ${screenshots}: one attempt, no image bytes in model/report`, async t => {
-  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'passed', ' '), checkpoint()] }, { calls: [finish()] }], { screenshots });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'invalid'), checkpoint()] }, { calls: [finish()] }], { screenshots });
   await env.run(); assert.equal(env.screenshotCalls.length, 1);
   assert.equal(env.reports()[0].reported_verdict, 'passed');
   assert.doesNotMatch(JSON.stringify(env.contexts), /iVBOR|image\/png|qa-diagnostics|checkpoint-001\.png/);
@@ -564,7 +575,7 @@ test('storage failure closes gate before browser and further provider requests',
 
 const closeCall = () => call('mcp__browse__tabs', 'model-close', { action: 'close', tab: 'chrome:7' });
 for (const status of ['passed', 'failed', 'blocked'] as const) test(`automatic tab close after ${status} preserves verdict and rejects model siblings`, async t => {
-  const calls = [plan(), navigate(), checkpoint('S1', status, 'Observed result', status === 'passed' ? '' : 'Persistent obstacle after safe recovery')];
+  const calls = [plan(), navigate(), checkpoint('S1', status)];
   if (status === 'passed') calls.push(finish());
   calls.push(closeCall(), browser('after'));
   const env = await setup(t, [{ calls }], { closeTab: 'ok', screenshots: 'ok', onClose: () => {
@@ -599,7 +610,7 @@ test('real user abort closes tab with an independent cleanup signal', async t =>
 test('abort during checkpoint diagnostics closes only after capture returns', async t => {
   let started!: () => void, release!: () => void;
   const captured = new Promise<void>(r => { started = r; }); const wait = new Promise<void>(r => { release = r; });
-  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'blocked', '', 'Missing access'), browser('after')] }], { closeTab: 'ok', screenshots: 'ok', captureStarted: started, captureWait: wait });
+  const env = await setup(t, [{ calls: [plan(), navigate(), checkpoint('S1', 'blocked'), browser('after')] }], { closeTab: 'ok', screenshots: 'ok', captureStarted: started, captureWait: wait });
   const running = env.run(); await captured; assert.equal(env.closeCalls.length, 0);
   const aborting = env.session.abort(); release(); await aborting; await running;
   assert.deepEqual(env.lifecycle, ['screenshot', 'close']);

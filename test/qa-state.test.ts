@@ -16,10 +16,10 @@ function planned(t: TestContext) {
   run.plan({ subtasks });
   return run;
 }
-const result = (subtask_id = 'S1', status = 'passed', observation = 'Selected value visible', reason = '') => ({
-  subtask_id, status, observation, reason,
-  url_before: null,
-  url_after: observation ? fixture.url : null,
+const result = (subtask_id = 'S1', status = 'passed') => ({ subtask_id, status });
+const urls = { url_before: null, url_after: fixture.url };
+const estimate = (observation: string | null, reason: string | null = null) => ({
+  observation, reason, confidence_score: 92, reasoning: 'Browser evidence',
 });
 const finish = { verdict: 'passed' };
 
@@ -70,13 +70,16 @@ test('checkpoint persists before diagnostics; no next action until completion; f
   assert.equal(run.report().stage, 'executing');
   assert.equal(run.report().active_subtask_id, 'S2');
   assert.throws(() => run.checkpoint(result('S1')));
-  run.checkpoint(result('S2', 'passed', 'List checked'));
+  run.checkpoint(result('S2'));
   run.completeCheckpoint();
   assert.equal(run.report().stage, 'awaiting_finish');
   assert.equal(run.allowsTool('browser_execute'), false);
   assert.throws(() => run.finish({ verdict: 'failed', reason: 'invented' }));
   run.finish(finish);
   run.finish({ verdict: 'failed', reason: 'late' });
+  assert.equal(run.report().evidence, '');
+  run.recordConfidence(1, urls, estimate('Selected value visible'));
+  run.recordConfidence(2, urls, estimate('List checked'));
   const report = run.report();
   assert.equal(report.reported_verdict, 'passed');
   assert.equal(report.evidence, 'S1: Selected value visible\nS2: List checked');
@@ -89,7 +92,7 @@ test('checkpoint persists before diagnostics; no next action until completion; f
 
 for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint finishes after diagnostics, including abort in between`, t => {
   const run = planned(t);
-  run.checkpoint(result('S1', status, '', 'Browser unavailable after reconnect attempt'));
+  run.checkpoint(result('S1', status));
   assert.equal(run.isTerminal, false);
   run.end('aborted', 'User abort during screenshot');
   assert.equal(run.report().reported_verdict, status);
@@ -98,11 +101,14 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
   assert.equal(run.report().plan.length, 2);
   assert.equal(run.report().active_subtask_id, null);
   assert.equal(run.allowsTool('browser_execute'), false);
+  run.recordConfidence(1, urls, estimate(null, 'Browser unavailable after reconnect attempt'));
+  assert.equal(run.report().reason, 'Browser unavailable after reconnect attempt');
+  assert.equal(run.report().reported_verdict, status);
 });
 
 test('invalid checkpoint does not mutate active task or revision', t => {
   const run = planned(t);
-  for (const input of [result('S2'), result('S1', 'passed', ' '), result('S1', 'blocked', '', ''), result('S1', 'failed', '', ''), result('S1', 'unknown'), result('S1', 'passed', 'x'.repeat(1001))]) assert.throws(() => run.checkpoint(input));
+  for (const input of [result('S2'), result('S1', 'unknown'), { subtask_id: 'S1' }, { ...result(), observation: 'Extra field' }]) assert.throws(() => run.checkpoint(input));
   assert.equal(run.report().stage, 'executing');
   assert.equal(run.report().subtask_results.length, 0);
   run.checkpoint(result());
@@ -111,21 +117,21 @@ test('invalid checkpoint does not mutate active task or revision', t => {
   assert.equal(run.report().progress?.revision, 1);
 });
 
-test('checkpoint URLs are required and invalid values leave the step retryable', t => {
+test('status-only checkpoint leaves diagnostic fields pending until background write', t => {
   const run = planned(t);
-  for (const [field, values] of Object.entries({
-    url_before: [undefined, '', '/form'],
-    url_after: [undefined, 42, 'invalid url'],
-  })) {
-    for (const value of values) {
-      assert.throws(() => run.checkpoint({ ...result(), [field]: value }), new RegExp(field));
-    }
-  }
-  assert.equal(run.report().subtask_results.length, 0);
-  run.checkpoint({ ...result(), url_before: 'about:blank', url_after: null });
+  run.checkpoint(result());
   run.completeCheckpoint();
-  run.checkpoint(result('S2'));
-  assert.deepEqual(run.report().subtask_results.map(item => item.confidence_score), [null, null]);
+  assert.equal(run.report().active_subtask_id, 'S2');
+  const [pending] = run.report().subtask_results;
+  assert.equal(pending.confidence_status, 'pending');
+  assert.equal(pending.observation, null);
+  assert.equal(pending.reason, null);
+  assert.equal(pending.url_before, null);
+  assert.equal(pending.url_after, null);
+  run.recordConfidence(1, urls, estimate('Observed browser evidence'));
+  assert.equal(run.report().subtask_results[0].url_after, fixture.url);
+  assert.equal(run.report().progress?.observation, 'Observed browser evidence');
+  assert.doesNotMatch(run.progressContext(), /Observed browser evidence/);
 });
 
 test('only blocked emergency finish is available before plan', t => {
@@ -143,7 +149,6 @@ test('compact context restores current task without repeating complete plan or p
   run.checkpoint(result()); run.completeCheckpoint();
   assert.match(run.progressContext()!, /Check list/);
   assert.doesNotMatch(run.progressContext()!, /Fill and submit form/);
-  assert.match(run.progressContext()!, /Selected value visible/);
   assert.match(run.caseContext(), /Create item/);
 });
 
@@ -171,12 +176,11 @@ test('storage failure closes gate and retains accepted checkpoint', t => {
 
 test('terminal state names accepted outcome and never presents pending task as current', t => {
   const run = planned(t);
-  run.checkpoint(result('S1', 'blocked', '', 'Required login unavailable after recovery'));
+  run.checkpoint(result('S1', 'blocked'));
   run.completeCheckpoint();
   const context = run.progressContext();
   assert.doesNotMatch(context, /Check list/);
   assert.match(context, /blocked/);
-  assert.match(context, /Required login unavailable after recovery/);
 });
 
 test('finish input requires only verdict for passed and only reason for non-passed', () => {
