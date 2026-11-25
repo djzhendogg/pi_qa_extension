@@ -387,7 +387,7 @@ for (const [failure, firstAnswer] of [
   ['provider error', { text: '', stopReason: 'error' }],
   ['truncated answer', { text: '{"confidence_score":', stopReason: 'length' }],
   ['invalid JSON', '{"confidence_score":'],
-] as const) test(`confidence retries once after ${failure} with thinking off and 2048 tokens`, async t => {
+] as const) test(`confidence retries once after ${failure} with thinking off and 8192 tokens`, async t => {
   const attempts: Array<SimpleStreamOptions | undefined> = [];
   const env = await setup(t, [{ calls: success() }], {
     assessConfidence(_context, options) {
@@ -403,7 +403,7 @@ for (const [failure, firstAnswer] of [
   assert.equal(env.requests(), 1);
   assert.equal(attempts.length, 2);
   for (const options of attempts) {
-    assert.equal(options?.maxTokens, 2048);
+    assert.equal(options?.maxTokens, 8192);
     assert.equal(options?.reasoning, undefined);
     assert.equal(options?.maxRetries, 0);
   }

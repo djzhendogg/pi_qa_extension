@@ -59,9 +59,9 @@ export class QaConfidence {
               messages,
             }, {
               reasoning: undefined, // Pi represents thinking off by omitting reasoning.
-              maxTokens: 2048,
+              maxTokens: 8192,
               maxRetries: 0, // This queue owns the retry, including validation failures.
-              signal: AbortSignal.timeout(15_000),
+              signal: AbortSignal.timeout(45_000),
             }).result();
             if (response.stopReason !== 'stop') throw new Error(`Confidence request ended with ${response.stopReason}`);
             const text = response.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n');
