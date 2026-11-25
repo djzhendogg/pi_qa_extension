@@ -27,7 +27,7 @@ export interface SubtaskResult {
 export type ConfidenceInput = Pick<SubtaskResult, 'subtask_id' | 'status' | 'url_before' | 'url_after'> & {
   readonly description: string;
 };
-export type ConfidenceEstimate = Pick<SubtaskResult, 'observation' | 'reason'> & { confidence_score: number; reasoning: string };
+export type ConfidenceEstimate = Pick<SubtaskResult, 'observation'> & { confidence_score: number; reasoning: string };
 export type FinishInput = { verdict: 'passed' } | { verdict: 'failed' | 'blocked'; reason: string };
 export interface ProgressSnapshot {
   readonly completed: readonly string[];
@@ -162,11 +162,14 @@ export class QaRun {
   checkpoint(input: unknown): { revision: number; evidence: ConfidenceInput } {
     this.requireStage('executing');
     const value = object(input);
-    onlyKeys(value, ['subtask_id', 'status', 'url_before', 'url_after']);
     if (value.subtask_id !== this.active) throw new Error(`Checkpoint requires active subtask ${this.active}`);
     if (!['passed', 'failed', 'blocked'].includes(value.status as string)) throw new Error('Invalid subtask status');
+    const status = value.status as Verdict;
+    const fields = ['subtask_id', 'status', 'url_before', 'url_after'];
+    onlyKeys(value, status === 'passed' ? fields : [...fields, 'reason']);
+    const reason = status === 'passed' ? null : boundedString(value.reason, 'reason', 1000);
     const result: SubtaskResult = Object.freeze({
-      subtask_id: this.active!, status: value.status as Verdict, observation: null, reason: null,
+      subtask_id: this.active!, status, observation: null, reason,
       url_before: checkpointUrl(value.url_before, 'url_before'),
       url_after: checkpointUrl(value.url_after, 'url_after'),
       confidence_score: null, reasoning: null, confidence_status: 'pending',
@@ -176,7 +179,7 @@ export class QaRun {
     this.stage = 'checkpointing'; // Keep browser actions closed while saving the checkpoint.
     this.progress = Object.freeze({
       completed: Object.freeze(this.results.map(item => item.subtask_id)),
-      current_objective: value.status === 'passed' ? this.tasks[this.results.length]?.description ?? 'Finish QA run' : '',
+      current_objective: status === 'passed' ? this.tasks[this.results.length]?.description ?? 'Finish QA run' : '',
       observation: null, source: 'agent_reported', revision: result.revision,
     });
     this.persist();
@@ -195,7 +198,6 @@ export class QaRun {
     const updated: SubtaskResult = Object.freeze({
       ...result,
       observation: estimate?.observation ?? null,
-      reason: result.status === 'passed' ? null : estimate?.reason ?? null,
       confidence_score: estimate?.confidence_score ?? null,
       reasoning: estimate?.reasoning ?? null,
       confidence_status: estimate ? 'completed' : 'failed',
@@ -212,7 +214,7 @@ export class QaRun {
     const result = this.results.at(-1)!;
     this.active = null;
     if (result.status !== 'passed') {
-      this.complete(result.status);
+      this.complete(result.status, result.reason ?? '');
     } else {
       this.activateNextSubtask();
       this.persist();
@@ -253,7 +255,7 @@ export class QaRun {
       reported_verdict: this.verdict,
       verification_status: this.verdict ? 'agent_reported' : 'not_evaluated', verified_verdict: null,
       progress: this.progress, evidence: this.verdict ? this.aggregateEvidence() : '',
-      reason: this.reason || (this.verdict && this.verdict !== 'passed' ? this.results.at(-1)?.reason ?? '' : ''),
+      reason: this.reason,
       started_at: new Date(this.startedAt).toISOString(), ended_at: this.endedAt === null ? null : new Date(this.endedAt).toISOString(),
       duration_ms: (this.endedAt ?? Date.now()) - this.startedAt,
       telemetry: {

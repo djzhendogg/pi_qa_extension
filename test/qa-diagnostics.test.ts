@@ -30,11 +30,13 @@ test('uses the observed tab and strips the checkpoint image before its backgroun
   const calls: unknown[] = [];
   const imagePath = join(dir, 'checkpoint-001.png');
   let writtenDuringCapture: boolean | undefined;
-  await diagnostics.capture(1, 'checkpoint', {
+  const captured = await diagnostics.capture(1, 'checkpoint', {
     tools,
     async executeTool(name, args) {
       calls.push({ name, args });
-      const filtered = diagnostics.observe({ toolName: name, input: args, parentToolCallId: 'checkpoint',
+      const call = { toolName: name, input: args, parentToolCallId: 'checkpoint' };
+      assert.equal(diagnostics.allowsCapture(call), true);
+      const filtered = diagnostics.observe({ ...call,
         content: [{ type: 'image', mimeType: 'image/png', data: png }], isError: false }, tools);
       writtenDuringCapture = existsSync(imagePath);
       assert.ok(filtered);
@@ -42,11 +44,32 @@ test('uses the observed tab and strips the checkpoint image before its backgroun
       return { isError: false };
     },
   });
+  assert.deepEqual(captured, { path: imagePath, mimeType: 'image/png' });
   assert.deepEqual(calls, [{ name: 'mcp__browse__screenshot', args: { tab: 'new', format: 'png' } }]);
   assert.equal(writtenDuringCapture, false);
   await diagnostics.flushWrites();
   assert.deepEqual(readFileSync(imagePath), Buffer.from(png, 'base64'));
   assert.equal(readdirSync(dir).filter(name => name.endsWith('.png')).length, 1);
+});
+
+test('the diagnostic tab is reserved by name and numeric ID', async t => {
+  const { diagnostics } = setup(t);
+  const tabsTool = 'mcp__browse__tabs';
+  const catalog = [...tools, { name: tabsTool, parameters: { properties: { id: {}, action: { enum: ['new', 'close'] } } } }];
+  await diagnostics.captureBaseline('plan', {
+    tools: catalog,
+    async executeTool(toolName, input) {
+      const internal = { toolName, input, parentToolCallId: 'plan' };
+      assert.equal(diagnostics.allowsCapture(internal), true);
+      if (input.action === 'new') {
+        diagnostics.observe({ ...internal, content: [{ type: 'text', text: '{"tab":17}' }], isError: false }, catalog);
+        assert.equal(diagnostics.targetsBaselineTab({ toolName, input: { action: 'new', id: ` ${input.id} ` } }), true);
+        assert.equal(diagnostics.targetsBaselineTab({ toolName, input: { action: 'close', tabs: [17] } }), true);
+        assert.equal(diagnostics.targetsBaselineTab({ toolName, input: { action: 'close', tabs: [18] } }), false);
+      }
+      return { isError: false };
+    },
+  });
 });
 
 test('capture failure is nonfatal, logged separately, and never retried', async t => {

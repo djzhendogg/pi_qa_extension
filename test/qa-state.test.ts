@@ -17,8 +17,8 @@ function planned(t: TestContext) {
   return run;
 }
 const result = (subtask_id = 'S1', status = 'passed') => ({ subtask_id, status, url_before: null, url_after: null });
-const estimate = (observation: string | null, reason: string | null = null) => ({
-  observation, reason, confidence_score: 92, reasoning: 'Browser evidence',
+const estimate = (observation: string | null) => ({
+  observation, confidence_score: 92, reasoning: 'Browser evidence',
 });
 const finish = { verdict: 'passed' };
 
@@ -89,9 +89,12 @@ test('checkpoint persists before diagnostics; no next action until completion; f
   assert.equal(readdirSync(dirname(run.reportPath)).length, 1);
 });
 
-for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint finishes after diagnostics, including abort in between`, t => {
+for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint persists its reason before diagnostics and preserves it on abort`, t => {
   const run = planned(t);
-  run.checkpoint(result('S1', status));
+  const reason = 'Browser unavailable after reconnect attempt';
+  run.checkpoint({ ...result('S1', status), reason });
+  const saved = JSON.parse(readFileSync(run.reportPath, 'utf8'));
+  assert.equal(saved.subtask_results[0].reason, reason);
   assert.equal(run.isTerminal, false);
   run.end('aborted', 'User abort during screenshot');
   assert.equal(run.report().reported_verdict, status);
@@ -100,14 +103,22 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
   assert.equal(run.report().plan.length, 2);
   assert.equal(run.report().active_subtask_id, null);
   assert.equal(run.allowsTool('browser_execute'), false);
-  run.recordConfidence(1, estimate(null, 'Browser unavailable after reconnect attempt'));
-  assert.equal(run.report().reason, 'Browser unavailable after reconnect attempt');
+  assert.equal(run.report().reason, reason);
+  assert.match(run.progressContext(), /Browser unavailable after reconnect attempt/);
+  run.recordConfidence(1, estimate(null));
+  assert.equal(run.report().reason, reason);
+  assert.equal(run.report().subtask_results[0].reason, reason);
   assert.equal(run.report().reported_verdict, status);
 });
 
 test('invalid checkpoint does not mutate active task or revision', t => {
   const run = planned(t);
-  for (const input of [result('S2'), result('S1', 'unknown'), { subtask_id: 'S1' }, { ...result(), observation: 'Extra field' }]) assert.throws(() => run.checkpoint(input));
+  for (const input of [
+    result('S2'), result('S1', 'unknown'), { subtask_id: 'S1' },
+    { ...result(), observation: 'Extra field' }, { ...result(), reason: 'Unexpected reason' },
+    result('S1', 'failed'), { ...result('S1', 'blocked'), reason: ' ' },
+    { ...result('S1', 'failed'), reason: 'x'.repeat(1001) },
+  ]) assert.throws(() => run.checkpoint(input));
   assert.throws(() => run.checkpoint({ subtask_id: 'S1', status: 'passed', url_before: null }), /url_after must be an absolute URL or null/);
   assert.throws(() => run.checkpoint({ ...result(), url_before: '/relative' }), /url_before must be an absolute URL or null/);
   assert.equal(run.report().stage, 'executing');
@@ -177,7 +188,7 @@ test('storage failure closes gate and retains accepted checkpoint', t => {
 
 test('terminal state names accepted outcome and never presents pending task as current', t => {
   const run = planned(t);
-  run.checkpoint(result('S1', 'blocked'));
+  run.checkpoint({ ...result('S1', 'blocked'), reason: 'No permission to continue' });
   run.completeCheckpoint();
   const context = run.progressContext();
   assert.doesNotMatch(context, /Check list/);

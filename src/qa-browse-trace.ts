@@ -1,7 +1,6 @@
-import { browseResultTexts, findScreenshotTool, outputTab, parseJson, type CatalogTool, type Observation } from './qa-diagnostics.ts';
+import { browseResultTexts, findScreenshotTool, type CatalogTool, type Observation } from './qa-diagnostics.ts';
 import { sanitizeObservedUrl } from './qa-state.ts';
 
-type Tab = string | number;
 type TraceInput = Record<string, string | number | boolean>;
 interface BrowseCall { toolCallId: string; toolName: string; input: Record<string, unknown> }
 interface TraceEntry {
@@ -10,21 +9,12 @@ interface TraceEntry {
   status: 'ok' | 'error' | 'pending';
   result: string | null;
 }
-interface DomObservation { tab: Tab; url: string | null; text: string }
 export interface BrowseEvidence {
   browse_trace: TraceEntry[];
-  dom_before: DomObservation | null;
-  dom_after: DomObservation | null;
 }
 interface StepCall {
   entry: TraceEntry;
   operation: string;
-  namespace: string;
-  inputTab?: Tab;
-  tab?: Tab;
-  readOnly: boolean;
-  before?: DomObservation;
-  after?: DomObservation;
 }
 
 const plainTools = new Set([
@@ -36,21 +26,17 @@ const plainTools = new Set([
 ]);
 const safeKeys = ['action', 'tab', 'url', 'targetUrl', 'selector', 'ref', 'role', 'key', 'button', 'direction', 'force'];
 const secretValue = /(["']?(?:password|passcode|token|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|authorization|api[_-]?key|cookie|set-cookie|session[_-]?(?:id|key)|otp)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,}&]+)/gi;
-const pageNeutralTools = /^(?:status|settings|network|console|recording|screenshot_diff|secrets(?:_.*)?)$/;
 const sensitiveTools = /^(?:network|secrets(?:_|$)|upload|settings|webmcp|screenshot_diff)/;
-const snapshotScript = /(?:^|[;\n])\s*(?:return\s+)?(?:await\s+)?(?:snapshot|ariaSnapshot)\(\s*\)\s*;?\s*$/;
-const readOnlySnapshotScript = /^\s*(?:return\s+)?(?:await\s+)?(?:snapshot|ariaSnapshot)\(\s*\)\s*;?\s*$/;
-const readOnlyUrlScript = /^\s*(?:return\s+)?(?:await\s+)?page\.url\(\s*\)\s*;?\s*$/;
 
-function describeTool(name: string, tools: readonly CatalogTool[]) {
+function browseOperation(name: string, tools: readonly CatalogTool[]): string | undefined {
   const namespace = /^(?:mcp__(?:browse|browser(?:[-_]control)?)__|(?:browse|browser)_)/i.exec(name)?.[0];
   if (namespace !== undefined || plainTools.has(name)) {
-    return { namespace: namespace ?? '', operation: name.slice(namespace?.length ?? 0) };
+    return name.slice(namespace?.length ?? 0);
   }
   const screenshot = findScreenshotTool(tools);
   const customNamespace = screenshot?.name.slice(0, -'screenshot'.length);
   if (customNamespace && name.startsWith(customNamespace)) {
-    return { namespace: customNamespace, operation: name.slice(customNamespace.length) };
+    return name.slice(customNamespace.length);
   }
 }
 
@@ -99,30 +85,17 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function pageKey(namespace: string, tab: Tab): string {
-  return JSON.stringify([namespace, tab]);
-}
-
-function matchesUrl(dom: DomObservation | null, url: string | null): DomObservation | null {
-  return dom?.url && url && dom.url !== url ? null : dom;
-}
-
 export class QaBrowseTrace {
   private calls: StepCall[] = [];
   private pending = new Map<string, StepCall>();
-  private lastDom = new Map<string, DomObservation>();
 
   begin(event: BrowseCall, tools: readonly CatalogTool[]): void {
-    const tool = describeTool(event.toolName, tools);
-    if (!tool) return;
+    const operation = browseOperation(event.toolName, tools);
+    if (!operation) return;
     const entry: TraceEntry = {
-      tool: event.toolName, input: traceInput(event.input, tool.operation), status: 'pending', result: null,
+      tool: event.toolName, input: traceInput(event.input, operation), status: 'pending', result: null,
     };
-    const { tab } = event.input;
-    const inputTab = typeof tab === 'string' || typeof tab === 'number' ? tab : undefined;
-    const readOnly = ['snapshot', 'aria_snapshot'].includes(tool.operation)
-      || (tool.operation === 'execute' && (readOnlySnapshotScript.test(script(event.input)) || readOnlyUrlScript.test(script(event.input))));
-    const call: StepCall = { entry, ...tool, inputTab, tab: inputTab, readOnly };
+    const call: StepCall = { entry, operation };
     this.calls.push(call);
     this.pending.set(event.toolCallId, call);
   }
@@ -133,76 +106,12 @@ export class QaBrowseTrace {
     this.pending.delete(event.toolCallId);
     const text = browseResultTexts(event).join('\n');
     const body = text.replace(/^(?:Tab:\s*|tab=)[^\r\n]*\r?\n/i, '').trim();
-    const parsedBody = parseJson(body);
-    const textPayload = record(parsedBody);
-    const structuredPayload = record(event.structuredContent);
-    const payload = textPayload && structuredPayload ? { ...textPayload, ...structuredPayload } : structuredPayload ?? textPayload;
-    const result = payload?.result ?? payload ?? parsedBody;
-    const fields = record(result);
+    const result = record(event.structuredContent)?.result;
     call.entry.status = event.isError ? 'error' : 'ok';
     call.entry.result = resultExcerpt(body || (typeof result === 'string' ? result : ''), call, event.input);
-    const tab = outputTab(event);
-    call.tab = tab;
-    if (event.isError || tab === undefined || sensitiveTools.test(call.operation)) return;
-    const headerUrl = /^URL:\s*(\S+)\s*$/im.exec(text)?.[1];
-    const plainUrl = typeof result === 'string' ? result : body;
-    const resultUrl = /^(?:https?:\/\/[^\s]+|about:blank)$/i.test(plainUrl) ? plainUrl : null;
-    const url = sanitizeObservedUrl(fields?.url_after ?? payload?.url_after ?? fields?.url ?? payload?.url ?? headerUrl ?? resultUrl);
-    const dom = (value: unknown, address: string | null = url): DomObservation | undefined => {
-      const snippet = typeof value === 'string' ? excerpt(value, 2400) : '';
-      return snippet ? { tab, url: address, text: snippet } : undefined;
-    };
-    call.after = dom(fields?.dom_after ?? fields?.snapshot);
-    const snapshotRead = ['snapshot', 'aria_snapshot'].includes(call.operation)
-      || (call.operation === 'execute' && snapshotScript.test(script(event.input)));
-    if (!call.after && snapshotRead) {
-      call.after = dom(typeof result === 'string' ? result : fields?.text ?? (parsedBody === undefined ? body : undefined));
-    }
-    if (call.operation === 'execute') {
-      const urlBefore = sanitizeObservedUrl(fields?.url_before ?? payload?.url_before);
-      call.before = dom(fields?.dom_before, urlBefore ?? (call.readOnly ? url : null));
-    }
   }
 
-  finish(urlBefore: string | null, urlAfter: string | null): BrowseEvidence {
-    let started = false;
-    let changed = false;
-    let firstPage: string | undefined;
-    let before: DomObservation | null = null;
-    let after: DomObservation | null = null;
-    const currentDom = new Map<string, DomObservation>();
-    for (const call of this.calls) {
-      if (pageNeutralTools.test(call.operation) || (call.operation === 'tabs' && !['new', 'close'].includes(String(call.entry.input.action)))) continue;
-      const inputKey = call.inputTab === undefined ? undefined : pageKey(call.namespace, call.inputTab);
-      const outputKey = call.tab === undefined ? undefined : pageKey(call.namespace, call.tab);
-      const initialKey = inputKey ?? outputKey;
-      if (!started) {
-        firstPage = initialKey;
-        before = call.before ?? (call.readOnly ? call.after : undefined) ?? (initialKey ? this.lastDom.get(initialKey) : undefined) ?? null;
-        started = true;
-      } else if (!changed && initialKey && initialKey === firstPage) {
-        before = call.before ?? (call.readOnly ? call.after : undefined) ?? before;
-      }
-      if (!call.readOnly) {
-        changed = true;
-        if (initialKey) {
-          this.lastDom.delete(initialKey);
-          currentDom.delete(initialKey);
-        } else {
-          this.lastDom.clear();
-          currentDom.clear();
-        }
-        if (outputKey) {
-          this.lastDom.delete(outputKey);
-          currentDom.delete(outputKey);
-        }
-      }
-      if (outputKey && call.after) {
-        this.lastDom.set(outputKey, call.after);
-        currentDom.set(outputKey, call.after);
-      }
-      after = (outputKey ? currentDom.get(outputKey) : undefined) ?? null;
-    }
+  finish(): BrowseEvidence {
     // Preserve the call sequence and favor the most recent text when the trace is large.
     let remaining = 12_000;
     for (const { entry } of this.calls.toReversed()) {
@@ -213,10 +122,6 @@ export class QaBrowseTrace {
     const browse_trace = this.calls.map(call => call.entry);
     this.calls = [];
     this.pending.clear();
-    return {
-      browse_trace,
-      dom_before: matchesUrl(before, urlBefore),
-      dom_after: matchesUrl(after, urlAfter),
-    };
+    return { browse_trace };
   }
 }
