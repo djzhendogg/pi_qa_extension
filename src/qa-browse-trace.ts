@@ -1,5 +1,5 @@
-import { findScreenshotTool, outputTab, type CatalogTool, type Observation } from './qa-diagnostics.ts';
-import type { ObservedUrls } from './qa-state.ts';
+import { browseResultTexts, findScreenshotTool, outputTab, parseJson, type CatalogTool, type Observation } from './qa-diagnostics.ts';
+import { sanitizeObservedUrl } from './qa-state.ts';
 
 type Tab = string | number;
 type TraceInput = Record<string, string | number | boolean>;
@@ -11,7 +11,7 @@ interface TraceEntry {
   result: string | null;
 }
 interface DomObservation { tab: Tab; url: string | null; text: string }
-export interface BrowseEvidence extends ObservedUrls {
+export interface BrowseEvidence {
   browse_trace: TraceEntry[];
   dom_before: DomObservation | null;
   dom_after: DomObservation | null;
@@ -25,8 +25,6 @@ interface StepCall {
   readOnly: boolean;
   before?: DomObservation;
   after?: DomObservation;
-  urlBefore?: string | null;
-  urlAfter?: string | null;
 }
 
 const plainTools = new Set([
@@ -37,7 +35,6 @@ const plainTools = new Set([
   'session_delete', 'session_adopt',
 ]);
 const safeKeys = ['action', 'tab', 'url', 'targetUrl', 'selector', 'ref', 'role', 'key', 'button', 'direction', 'force'];
-const secretKey = /password|passcode|passwd|credential|secret|token|authorization|api[_-]?key|cookie|session[_-]?(?:id|key)|otp|^pass$/i;
 const secretValue = /(["']?(?:password|passcode|token|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|authorization|api[_-]?key|cookie|set-cookie|session[_-]?(?:id|key)|otp)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,}&]+)/gi;
 const pageNeutralTools = /^(?:status|settings|network|console|recording|screenshot_diff|secrets(?:_.*)?)$/;
 const sensitiveTools = /^(?:network|secrets(?:_|$)|upload|settings|webmcp|screenshot_diff)/;
@@ -57,19 +54,9 @@ function describeTool(name: string, tools: readonly CatalogTool[]) {
   }
 }
 
-function cleanUrl(value: unknown): string | null {
-  if (typeof value !== 'string' || !URL.canParse(value)) return null;
-  const url = new URL(value);
-  url.username = '';
-  url.password = '';
-  for (const key of [...url.searchParams.keys()]) if (secretKey.test(key)) url.searchParams.delete(key);
-  if (secretKey.test(url.hash)) url.hash = '';
-  return url.href;
-}
-
 function excerpt(value: string, limit: number): string {
   const clean = value.replace(/data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/g, '[image omitted]')
-    .replace(/https?:\/\/[^\s"'<>]+/g, url => cleanUrl(url) ?? '[URL omitted]')
+    .replace(/https?:\/\/[^\s"'<>]+/g, url => sanitizeObservedUrl(url) ?? '[URL omitted]')
     .replace(secretValue, '$1[redacted]')
     .replace(/\bBearer\s+[\w.~+/-]+=*/gi, 'Bearer [redacted]')
     .trim();
@@ -112,20 +99,18 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function parsed(text: string): unknown {
-  try { return JSON.parse(text); }
-  catch { return undefined; }
-}
-
 function pageKey(namespace: string, tab: Tab): string {
   return JSON.stringify([namespace, tab]);
+}
+
+function matchesUrl(dom: DomObservation | null, url: string | null): DomObservation | null {
+  return dom?.url && url && dom.url !== url ? null : dom;
 }
 
 export class QaBrowseTrace {
   private calls: StepCall[] = [];
   private pending = new Map<string, StepCall>();
   private lastDom = new Map<string, DomObservation>();
-  private lastUrl = new Map<string, string>();
 
   begin(event: BrowseCall, tools: readonly CatalogTool[]): void {
     const tool = describeTool(event.toolName, tools);
@@ -146,10 +131,12 @@ export class QaBrowseTrace {
     const call = this.pending.get(event.toolCallId);
     if (!call || call.entry.tool !== event.toolName) return;
     this.pending.delete(event.toolCallId);
-    const text = event.content.filter(block => block.type === 'text').map(block => block.text ?? '').join('\n');
+    const text = browseResultTexts(event).join('\n');
     const body = text.replace(/^(?:Tab:\s*|tab=)[^\r\n]*\r?\n/i, '').trim();
-    const parsedBody = parsed(body);
-    const payload = record(event.structuredContent) ?? record(parsedBody);
+    const parsedBody = parseJson(body);
+    const textPayload = record(parsedBody);
+    const structuredPayload = record(event.structuredContent);
+    const payload = textPayload && structuredPayload ? { ...textPayload, ...structuredPayload } : structuredPayload ?? textPayload;
     const result = payload?.result ?? payload ?? parsedBody;
     const fields = record(result);
     call.entry.status = event.isError ? 'error' : 'ok';
@@ -160,8 +147,7 @@ export class QaBrowseTrace {
     const headerUrl = /^URL:\s*(\S+)\s*$/im.exec(text)?.[1];
     const plainUrl = typeof result === 'string' ? result : body;
     const resultUrl = /^(?:https?:\/\/[^\s]+|about:blank)$/i.test(plainUrl) ? plainUrl : null;
-    call.urlBefore = cleanUrl(fields?.url_before ?? payload?.url_before);
-    const url = call.urlAfter = cleanUrl(fields?.url_after ?? payload?.url_after ?? fields?.url ?? payload?.url ?? headerUrl ?? resultUrl);
+    const url = sanitizeObservedUrl(fields?.url_after ?? payload?.url_after ?? fields?.url ?? payload?.url ?? headerUrl ?? resultUrl);
     const dom = (value: unknown, address: string | null = url): DomObservation | undefined => {
       const snippet = typeof value === 'string' ? excerpt(value, 2400) : '';
       return snippet ? { tab, url: address, text: snippet } : undefined;
@@ -173,18 +159,17 @@ export class QaBrowseTrace {
       call.after = dom(typeof result === 'string' ? result : fields?.text ?? (parsedBody === undefined ? body : undefined));
     }
     if (call.operation === 'execute') {
-      call.before = dom(fields?.dom_before, call.urlBefore ?? (call.readOnly ? url : null));
+      const urlBefore = sanitizeObservedUrl(fields?.url_before ?? payload?.url_before);
+      call.before = dom(fields?.dom_before, urlBefore ?? (call.readOnly ? url : null));
     }
   }
 
-  finish(): BrowseEvidence {
+  finish(urlBefore: string | null, urlAfter: string | null): BrowseEvidence {
     let started = false;
     let changed = false;
     let firstPage: string | undefined;
     let before: DomObservation | null = null;
     let after: DomObservation | null = null;
-    let url_before: string | null = null;
-    let url_after: string | null = null;
     const currentDom = new Map<string, DomObservation>();
     for (const call of this.calls) {
       if (pageNeutralTools.test(call.operation) || (call.operation === 'tabs' && !['new', 'close'].includes(String(call.entry.input.action)))) continue;
@@ -194,26 +179,21 @@ export class QaBrowseTrace {
       if (!started) {
         firstPage = initialKey;
         before = call.before ?? (call.readOnly ? call.after : undefined) ?? (initialKey ? this.lastDom.get(initialKey) : undefined) ?? null;
-        url_before = call.urlBefore ?? (call.readOnly ? call.urlAfter : null) ?? (initialKey ? this.lastUrl.get(initialKey) : null) ?? null;
         started = true;
       } else if (!changed && initialKey && initialKey === firstPage) {
         before = call.before ?? (call.readOnly ? call.after : undefined) ?? before;
-        url_before = call.urlBefore ?? (call.readOnly ? call.urlAfter : null) ?? url_before;
       }
       if (!call.readOnly) {
         changed = true;
         if (initialKey) {
           this.lastDom.delete(initialKey);
-          this.lastUrl.delete(initialKey);
           currentDom.delete(initialKey);
         } else {
           this.lastDom.clear();
-          this.lastUrl.clear();
           currentDom.clear();
         }
         if (outputKey) {
           this.lastDom.delete(outputKey);
-          this.lastUrl.delete(outputKey);
           currentDom.delete(outputKey);
         }
       }
@@ -221,9 +201,7 @@ export class QaBrowseTrace {
         this.lastDom.set(outputKey, call.after);
         currentDom.set(outputKey, call.after);
       }
-      if (outputKey && call.urlAfter) this.lastUrl.set(outputKey, call.urlAfter);
       after = (outputKey ? currentDom.get(outputKey) : undefined) ?? null;
-      url_after = (outputKey ? this.lastUrl.get(outputKey) : undefined) ?? null;
     }
     // Preserve the call sequence and favor the most recent text when the trace is large.
     let remaining = 12_000;
@@ -237,9 +215,8 @@ export class QaBrowseTrace {
     this.pending.clear();
     return {
       browse_trace,
-      dom_before: before?.url && url_before && before.url !== url_before ? null : before,
-      dom_after: after?.url && url_after && after.url !== url_after ? null : after,
-      url_before, url_after,
+      dom_before: matchesUrl(before, urlBefore),
+      dom_after: matchesUrl(after, urlAfter),
     };
   }
 }

@@ -24,11 +24,10 @@ export interface SubtaskResult {
   readonly revision: number;
   readonly source: 'agent_reported';
 }
-export type ConfidenceInput = Pick<SubtaskResult, 'subtask_id' | 'status'> & {
+export type ConfidenceInput = Pick<SubtaskResult, 'subtask_id' | 'status' | 'url_before' | 'url_after'> & {
   readonly description: string;
 };
 export type ConfidenceEstimate = Pick<SubtaskResult, 'observation' | 'reason'> & { confidence_score: number; reasoning: string };
-export type ObservedUrls = Pick<SubtaskResult, 'url_before' | 'url_after'>;
 export type FinishInput = { verdict: 'passed' } | { verdict: 'failed' | 'blocked'; reason: string };
 export interface ProgressSnapshot {
   readonly completed: readonly string[];
@@ -52,6 +51,24 @@ function boundedString(value: unknown, field: string, maximum: number): string {
   const text = requiredString(value, field);
   if (text.length > maximum) throw new Error(`${field} must be at most ${maximum} characters`);
   return text;
+}
+const secretUrlKey = /password|passcode|passwd|credential|secret|token|authorization|api[_-]?key|cookie|session[_-]?(?:id|key)|otp|^pass$/i;
+
+export function sanitizeObservedUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !URL.canParse(value)) return null;
+  const url = new URL(value);
+  url.username = '';
+  url.password = '';
+  for (const key of [...url.searchParams.keys()]) if (secretUrlKey.test(key)) url.searchParams.delete(key);
+  if (secretUrlKey.test(url.hash)) url.hash = '';
+  return url.href;
+}
+
+function checkpointUrl(value: unknown, field: string): string | null {
+  if (value === null) return null;
+  const url = sanitizeObservedUrl(value);
+  if (url === null) throw new Error(`${field} must be an absolute URL or null`);
+  return url;
 }
 export function parseTestCase(input: unknown): TestCase {
   const value = object(input);
@@ -145,12 +162,14 @@ export class QaRun {
   checkpoint(input: unknown): { revision: number; evidence: ConfidenceInput } {
     this.requireStage('executing');
     const value = object(input);
-    onlyKeys(value, ['subtask_id', 'status']);
+    onlyKeys(value, ['subtask_id', 'status', 'url_before', 'url_after']);
     if (value.subtask_id !== this.active) throw new Error(`Checkpoint requires active subtask ${this.active}`);
     if (!['passed', 'failed', 'blocked'].includes(value.status as string)) throw new Error('Invalid subtask status');
     const result: SubtaskResult = Object.freeze({
       subtask_id: this.active!, status: value.status as Verdict, observation: null, reason: null,
-      url_before: null, url_after: null, confidence_score: null, reasoning: null, confidence_status: 'pending',
+      url_before: checkpointUrl(value.url_before, 'url_before'),
+      url_after: checkpointUrl(value.url_after, 'url_after'),
+      confidence_score: null, reasoning: null, confidence_status: 'pending',
       revision: this.results.length + 1, source: 'agent_reported',
     });
     this.results = Object.freeze([...this.results, result]);
@@ -165,17 +184,16 @@ export class QaRun {
       revision: result.revision,
       evidence: {
         subtask_id: result.subtask_id, description: this.tasks[result.revision - 1].description,
-        status: result.status,
+        status: result.status, url_before: result.url_before, url_after: result.url_after,
       },
     };
   }
-  recordConfidence(revision: number, urls: ObservedUrls, estimate?: ConfidenceEstimate): void {
+  recordConfidence(revision: number, estimate?: ConfidenceEstimate): void {
     const index = revision - 1;
     const result = this.results[index];
     if (result?.confidence_status !== 'pending') return;
     const updated: SubtaskResult = Object.freeze({
       ...result,
-      ...urls,
       observation: estimate?.observation ?? null,
       reason: result.status === 'passed' ? null : estimate?.reason ?? null,
       confidence_score: estimate?.confidence_score ?? null,

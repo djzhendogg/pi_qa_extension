@@ -72,8 +72,7 @@ export class QaConfidence {
           }
         }
       }
-      const { url_before, url_after } = evidence;
-      try { run.recordConfidence(revision, { url_before, url_after }, estimate); }
+      try { run.recordConfidence(revision, estimate); }
       catch (error) { this.log('confidence_save_failed', String(error)); }
     });
   }

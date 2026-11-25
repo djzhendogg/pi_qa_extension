@@ -17,7 +17,8 @@ const finish = (id = 'finish'): ToolCall => ({ type: 'toolCall', id, name: 'qa_f
 const browser = (id: string): ToolCall => ({ type: 'toolCall', id, name: 'browser_execute', arguments: { action: id } });
 const call = (name: string, id: string, args: ToolCall['arguments']): ToolCall => ({ type: 'toolCall', name, id, arguments: args });
 const plan = (count = 1) => call('qa_plan', 'plan', { subtasks: Array.from({ length: count }, (_, i) => ({ subtask_id: 'S'+(i+1), description: 'Action '+(i+1) })) });
-const checkpoint = (id = 'S1', status = 'passed') => call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status });
+const checkpoint = (id = 'S1', status = 'passed', [url_before, url_after]: [string | null, string | null] = [null, null]) =>
+  call('qa_checkpoint', 'cp-'+id, { subtask_id: id, status, url_before, url_after });
 const success = () => [plan(), browser('work'), checkpoint(), finish()];
 const navigate = () => call('mcp__browse__navigate', 'navigate', { tab: 'chrome:7' });
 const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'chrome:7' });
@@ -293,11 +294,13 @@ test('QA requests replace Pi coding instructions and retain case, progress, and 
 });
 
 test('confidence runs outside the QA dialog and updates the original checkpoint', async t => {
+  const url_before = 'https://example.com/form';
+  const url_after = 'https://example.com/saved';
   let release!: () => void, nextRequest!: () => void;
   const wait = new Promise<void>(resolve => { release = resolve; });
   const continued = new Promise<void>(resolve => { nextRequest = resolve; });
   const env = await setup(t, [
-    { calls: [plan(2), browser('first'), checkpoint(), browser('second')] },
+    { calls: [plan(2), browser('first'), checkpoint('S1', 'passed', [url_before, url_after]), browser('second')] },
     { calls: [checkpoint('S2'), finish()] },
   ], {
     onRequest: count => { if (count === 2) nextRequest(); },
@@ -313,8 +316,12 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   try {
     await Promise.race([continued, running]);
     assert.deepEqual(env.actions, ['first', 'second']);
-    assert.equal(env.reports()[0].subtask_results[0].confidence_status, 'pending');
-    assert.equal(env.reports()[0].subtask_results[0].confidence_score, null);
+    const [pending] = env.reports()[0].subtask_results;
+    assert.ok(pending, 'checkpoint was saved while confidence is still waiting');
+    assert.equal(pending.confidence_status, 'pending');
+    assert.equal(pending.confidence_score, null);
+    assert.equal(pending.url_before, url_before);
+    assert.equal(pending.url_after, url_after);
   } finally {
     release();
     await running;
@@ -327,12 +334,14 @@ test('confidence runs outside the QA dialog and updates the original checkpoint'
   assert.ok(input?.role === 'user' && typeof input.content === 'string');
   assert.equal(context.messages.length, 2);
   assert.deepEqual(JSON.parse(input.content), {
-    subtask_id: 'S1', description: 'Action 1', status: 'passed', url_before: null, url_after: null,
+    subtask_id: 'S1', description: 'Action 1', status: 'passed', url_before, url_after,
     browse_trace: [{ tool: 'browser_execute', input: { action: 'first' }, status: 'ok', result: 'Observed page' }],
     dom_before: null, dom_after: null,
   });
   const [report] = env.reports();
   assert.equal(report.telemetry.llm_calls, 2);
+  assert.equal(report.subtask_results[0].url_before, url_before);
+  assert.equal(report.subtask_results[0].url_after, url_after);
   assert.deepEqual(report.subtask_results.map((result: { confidence_score: number }) => result.confidence_score), [95, 60]);
   assert.doesNotMatch(JSON.stringify(env.contexts), /Observed UI state/);
 });
@@ -343,9 +352,9 @@ test('confidence receives the step Browse trace and only fresh DOM observations'
   const shot = (id: string) => call('mcp__browse__snapshot', id, { tab });
   const click = (id: string, ref: string) => call('mcp__browse__click', id, { tab, ref });
   const env = await setup(t, [{ calls: [
-    plan(3), shot('before'), click('error', 'stale'), click('click', 'e12'), shot('after'), checkpoint('S1'),
-    call('mcp__browse__execute', 'execute', { tab, code: 'await ref("e12").click(); return { dom_after: await snapshot() };' }), checkpoint('S2'),
-    click('unobserved', 'e12'), checkpoint('S3'), finish(),
+    plan(3), shot('before'), click('error', 'stale'), click('click', 'e12'), shot('after'), checkpoint('S1', 'passed', [url, url]),
+    call('mcp__browse__execute', 'execute', { tab, code: 'await ref("e12").click(); return { dom_after: await snapshot() };' }), checkpoint('S2', 'passed', [url, url]),
+    click('unobserved', 'e12'), checkpoint('S3', 'passed', [url, null]), finish(),
   ] }], { browseEvidence: true });
   await env.run();
   const inputs = env.confidenceContexts.map(context => {
@@ -402,8 +411,9 @@ for (const [failure, firstAnswer] of [
 });
 
 test('two invalid confidence responses leave the QA verdict intact', async t => {
+  const url = 'https://example.com/form';
   const snapshot = call('mcp__browse__snapshot', 'snapshot', { tab: 'chrome:7' });
-  const env = await setup(t, [{ calls: [plan(), snapshot, checkpoint(), finish()] }], {
+  const env = await setup(t, [{ calls: [plan(), snapshot, checkpoint('S1', 'passed', [url, url]), finish()] }], {
     browseEvidence: true, assessConfidence: () => '{"confidence_score":101,"reasoning":"Invalid score"}',
   });
   await env.run();
@@ -416,8 +426,8 @@ test('two invalid confidence responses leave the QA verdict intact', async t => 
   assert.equal(step.reasoning, null);
   assert.equal(step.observation, null);
   assert.equal(step.reason, null);
-  assert.equal(step.url_before, 'https://example.com/form');
-  assert.equal(step.url_after, 'https://example.com/form');
+  assert.equal(step.url_before, url);
+  assert.equal(step.url_after, url);
 });
 
 test('stage gates reject pre-plan browser, skipped and duplicate checkpoint IDs in a mixed packet', async t => {

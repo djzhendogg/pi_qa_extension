@@ -16,8 +16,7 @@ function planned(t: TestContext) {
   run.plan({ subtasks });
   return run;
 }
-const result = (subtask_id = 'S1', status = 'passed') => ({ subtask_id, status });
-const urls = { url_before: null, url_after: fixture.url };
+const result = (subtask_id = 'S1', status = 'passed') => ({ subtask_id, status, url_before: null, url_after: null });
 const estimate = (observation: string | null, reason: string | null = null) => ({
   observation, reason, confidence_score: 92, reasoning: 'Browser evidence',
 });
@@ -78,8 +77,8 @@ test('checkpoint persists before diagnostics; no next action until completion; f
   run.finish(finish);
   run.finish({ verdict: 'failed', reason: 'late' });
   assert.equal(run.report().evidence, '');
-  run.recordConfidence(1, urls, estimate('Selected value visible'));
-  run.recordConfidence(2, urls, estimate('List checked'));
+  run.recordConfidence(1, estimate('Selected value visible'));
+  run.recordConfidence(2, estimate('List checked'));
   const report = run.report();
   assert.equal(report.reported_verdict, 'passed');
   assert.equal(report.evidence, 'S1: Selected value visible\nS2: List checked');
@@ -101,7 +100,7 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
   assert.equal(run.report().plan.length, 2);
   assert.equal(run.report().active_subtask_id, null);
   assert.equal(run.allowsTool('browser_execute'), false);
-  run.recordConfidence(1, urls, estimate(null, 'Browser unavailable after reconnect attempt'));
+  run.recordConfidence(1, estimate(null, 'Browser unavailable after reconnect attempt'));
   assert.equal(run.report().reason, 'Browser unavailable after reconnect attempt');
   assert.equal(run.report().reported_verdict, status);
 });
@@ -109,6 +108,8 @@ for (const status of ['failed', 'blocked'] as const) test(`${status} checkpoint 
 test('invalid checkpoint does not mutate active task or revision', t => {
   const run = planned(t);
   for (const input of [result('S2'), result('S1', 'unknown'), { subtask_id: 'S1' }, { ...result(), observation: 'Extra field' }]) assert.throws(() => run.checkpoint(input));
+  assert.throws(() => run.checkpoint({ subtask_id: 'S1', status: 'passed', url_before: null }), /url_after must be an absolute URL or null/);
+  assert.throws(() => run.checkpoint({ ...result(), url_before: '/relative' }), /url_before must be an absolute URL or null/);
   assert.equal(run.report().stage, 'executing');
   assert.equal(run.report().subtask_results.length, 0);
   run.checkpoint(result());
@@ -117,9 +118,9 @@ test('invalid checkpoint does not mutate active task or revision', t => {
   assert.equal(run.report().progress?.revision, 1);
 });
 
-test('status-only checkpoint leaves diagnostic fields pending until background write', t => {
+test('checkpoint sanitizes observed URLs before background diagnostics', t => {
   const run = planned(t);
-  run.checkpoint(result());
+  run.checkpoint({ ...result(), url_after: 'https://user:secret@example.com/form?token=secret&view=edit#session_id=secret' });
   run.completeCheckpoint();
   assert.equal(run.report().active_subtask_id, 'S2');
   const [pending] = run.report().subtask_results;
@@ -127,9 +128,9 @@ test('status-only checkpoint leaves diagnostic fields pending until background w
   assert.equal(pending.observation, null);
   assert.equal(pending.reason, null);
   assert.equal(pending.url_before, null);
-  assert.equal(pending.url_after, null);
-  run.recordConfidence(1, urls, estimate('Observed browser evidence'));
-  assert.equal(run.report().subtask_results[0].url_after, fixture.url);
+  assert.equal(pending.url_after, 'https://example.com/form?view=edit');
+  run.recordConfidence(1, estimate('Observed browser evidence'));
+  assert.equal(run.report().subtask_results[0].url_after, pending.url_after);
   assert.equal(run.report().progress?.observation, 'Observed browser evidence');
   assert.doesNotMatch(run.progressContext(), /Observed browser evidence/);
 });

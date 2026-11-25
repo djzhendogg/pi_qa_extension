@@ -38,16 +38,37 @@ export function sameNamespace(name: string, reference: string, operation = 'scre
   return prefix ? name.startsWith(prefix) : ['execute', 'navigate', 'click', 'fill', 'type', 'press', 'select', 'hover', 'drag', 'scroll', 'wait_for', 'snapshot', 'screenshot', 'tabs', 'eval', 'close', 'close_tab', 'tab_close'].includes(name);
 }
 
+export function parseJson(text: string): unknown {
+  try { return JSON.parse(text); }
+  catch { return undefined; }
+}
+
+function mcpText(value: unknown): string[] {
+  const content = object(value)?.content;
+  const blocks = Array.isArray(content) ? content : [content];
+  return blocks.flatMap(block => {
+    const item = object(block);
+    return item?.type === 'text' && typeof item.text === 'string' ? [item.text] : [];
+  });
+}
+
+export function browseResultTexts(event: Observation): string[] {
+  const structuredTexts = mcpText(event.structuredContent);
+  const texts = structuredTexts.length ? structuredTexts : mcpText(event);
+  // A proxy can serialize the entire MCP result as a text block.
+  return texts.flatMap(text => {
+    const wrapped = mcpText(parseJson(text));
+    return wrapped.length ? wrapped : [text];
+  });
+}
+
 export function outputTab(event: Observation): string | number | undefined {
   const structured = object(event.structuredContent);
   if (validTab(structured?.tab)) return structured.tab;
-  for (const block of event.content) {
-    if (block.type !== 'text' || !block.text) continue;
-    try {
-      const parsed = object(JSON.parse(block.text));
-      if (validTab(parsed?.tab)) return parsed.tab;
-    } catch { /* Browse can also return a plain protocol header. */ }
-    const header = /^(?:Tab:\s*|tab=)([^\s,]+)/i.exec(block.text);
+  for (const text of browseResultTexts(event)) {
+    const parsed = object(parseJson(text));
+    if (validTab(parsed?.tab)) return parsed.tab;
+    const header = /^(?:Tab:\s*|tab=)([^\s,]+)/i.exec(text);
     if (header) {
       const value = /^\d+$/.test(header[1]) ? Number(header[1]) : header[1];
       if (validTab(value)) return value;
