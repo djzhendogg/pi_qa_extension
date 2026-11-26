@@ -331,6 +331,13 @@ test('QA requests replace Pi coding instructions and retain case, progress, and 
     assert.doesNotMatch(prompt, /coding assistant running inside pi|<tools>|<rules>|<docs>/);
     assert.match(prompt, /Create the item exactly once/);
     assert.match(prompt, /First call qa_plan/);
+    assert.match(prompt, /snapshot.*interactive: true/);
+    assert.match(prompt, /Use eval only to read.*unavailable from the snapshot or locator/);
+    assert.match(prompt, /Avoid using getBoundingClientRect or offsetParent to choose click coordinates/);
+    assert.match(prompt, /In eval, pass only native CSS to querySelector and querySelectorAll/);
+    assert.match(prompt, /For click, fill, and type, identify exactly one intended element/);
+    assert.match(prompt, /Use nth only when the scenario identifies the target by position/);
+    assert.match(prompt, /Screenshots for QA diagnostics are captured automatically/);
     assert.ok(getCurrentTools(context.messages).some(tool => tool.name === 'browser_execute'));
   }
   assert.match(getCurrentSystemPrompt(env.contexts[2].messages), /"subtask_id":"S1"/);
