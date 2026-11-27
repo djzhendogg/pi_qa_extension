@@ -31,7 +31,7 @@ const screenshot = () => call('mcp__browse__screenshot', 'model-shot', { tab: 'c
 type Reply = { calls?: ToolCall[]; stopReason?: Exclude<AssistantMessage['stopReason'], 'pending'>; errorMessage?: string; waitForAbort?: boolean; usageInput?: number };
 type ConfidenceReply = string | { text: string; stopReason: 'error' | 'length' };
 
-async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext, options?: SimpleStreamOptions) => ConfidenceReply | Promise<ConfidenceReply>; browseEvidence?: boolean; visual?: 'ready' | 'missing-model'; baselineOpenError?: boolean; beforeScreenshot?: (tab: string, index: number) => Promise<void> | undefined } = {}) {
+async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?: boolean; startupCase?: boolean; invalidCase?: boolean; fromDisk?: boolean; compaction?: boolean; retry?: boolean; compactionFixture?: boolean; screenshots?: 'ok' | 'error' | 'bad-storage'; inline?: boolean; startupJson?: boolean; selectorRecipes?: string; conflict?: boolean; captureStarted?: () => void; captureWait?: Promise<void>; closeTab?: 'ok' | 'error' | 'throw'; onClose?: () => void; onRequest?: (count: number) => void; assessConfidence?: (context: TranscriptContext, options?: SimpleStreamOptions) => ConfidenceReply | Promise<ConfidenceReply>; browseEvidence?: boolean; visual?: 'ready' | 'missing-model'; baselineOpenError?: boolean; beforeScreenshot?: (tab: string, index: number) => Promise<void> | undefined } = {}) {
   const dir = mkdtempSync(join(process.cwd(), '.qa-test-'));
   const casePath = join(dir, 'case with spaces.json');
   const caseJson = JSON.stringify({ scenario_id: options.invalidCase ? '' : 'TC-001', url: 'https://example.com', task: 'Create the item exactly once' });
@@ -61,6 +61,7 @@ async function setup(t: TestContext, replies: Reply[], options: { brokenOutput?:
   assert.equal(loader.getExtensions().errors.length, 0);
   if (options.startupJson || options.conflict) loader.getExtensions().runtime.flagValues.set('qa-case-json', caseJson);
   if (options.startupCase || options.conflict) loader.getExtensions().runtime.flagValues.set('qa-case', casePath);
+  if (options.selectorRecipes !== undefined) loader.getExtensions().runtime.flagValues.set('qa-selector-recipes', options.selectorRecipes);
   if (options.brokenOutput) {
     const file = join(dir, 'occupied');
     writeFileSync(file, 'not a directory');
@@ -316,6 +317,24 @@ for (const options of [{}, { inline: true }, { startupJson: true }, { fromDisk: 
     assert.equal(report.progress.revision, 1);
     assert.equal(report.verified_verdict, null);
     assert.equal(env.requests(), 1);
+    assert.deepEqual(env.extensionErrors, []);
+  });
+}
+
+test('selector recipes appear verbatim in the section immediately after the QA case', async t => {
+  const recipes = 'Submit button:\n  [data-testid="submit"]';
+  const env = await setup(t, [{ calls: success() }], { startupJson: true, selectorRecipes: JSON.stringify(recipes) });
+  await env.run();
+  const prompt = getCurrentSystemPrompt(env.contexts[0].messages);
+  assert.ok(prompt.includes(`</qa_goal_guardian_case>\n\n<qa_goal_quardian_recipes>\n${recipes}\n</qa_goal_quardian_recipes>`));
+});
+
+for (const selectorRecipes of [undefined, '{broken', '{"selector":"button"}']) {
+  test(`QA case completes without a recipes section for input ${selectorRecipes}`, async t => {
+    const env = await setup(t, [{ calls: success() }], { startupJson: true, selectorRecipes });
+    await env.run();
+    assert.equal(getCurrentSystemMessage(env.contexts[0].messages)?.sections?.qa_goal_quardian_recipes, undefined);
+    assert.equal(env.reports()[0].reported_verdict, 'passed');
     assert.deepEqual(env.extensionErrors, []);
   });
 }

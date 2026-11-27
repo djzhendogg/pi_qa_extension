@@ -57,6 +57,7 @@ export default function qaExtension(pi: ExtensionAPI): void {
 
   pi.registerFlag('qa-case-json', { description: 'Inline JSON scenario (scenario_id, url, task)', type: 'string' });
   pi.registerFlag('qa-case', { description: 'JSON QA case to load before the first prompt', type: 'string' });
+  pi.registerFlag('qa-selector-recipes', { description: 'JSON-encoded string containing selector recipes for the QA system prompt', type: 'string' });
   pi.registerFlag('qa-results-dir', { description: 'QA JSON report directory (default: ./qa-results)', type: 'string' });
   pi.registerFlag('qa-diagnostics-dir', { description: 'QA screenshot directory (default: ./qa-diagnostics)', type: 'string' });
 
@@ -149,6 +150,15 @@ export default function qaExtension(pi: ExtensionAPI): void {
       event.systemPromptOptions.customPrompt ??= 'You are a browser QA agent. Execute the loaded test case using the QA workflow below.';
       event.systemPromptOptions.sections.qa_goal_guardian_rules = QA_RULES;
       event.systemPromptOptions.sections.qa_goal_guardian_case = run.caseContext();
+      const rawRecipes = pi.getFlag('qa-selector-recipes');
+      if (typeof rawRecipes === 'string') {
+        try {
+          const recipes: unknown = JSON.parse(rawRecipes);
+          if (typeof recipes === 'string') event.systemPromptOptions.sections.qa_goal_quardian_recipes = recipes;
+        } catch {
+          // Ignore malformed optional recipes so the case can still run.
+        }
+      }
     }
   });
 

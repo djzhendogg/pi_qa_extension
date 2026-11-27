@@ -54,6 +54,8 @@ npx --no-install pi -e .pi/extensions/qa.ts --qa-case ./test-case.json --no-sess
 
 `--qa-case-json` и `--qa-case` только загружают сценарий; prompt запускает модель. Одновременное указание обоих флагов, пустой источник или невалидный startup-сценарий блокируют модель и инструменты. После терминального исхода prompts блокируются до нового `/qa-run` или reload/смены сессии.
 
+Опциональный флаг `--qa-selector-recipes` принимает готовый текст рецептов селекторов в виде JSON-строки. В примере со `spawn` добавьте в массив аргументов `'--qa-selector-recipes', JSON.stringify(recipesText)`. Расширение помещает декодированный текст в секцию `qa_goal_quardian_recipes` сразу после `qa_goal_guardian_case`. Если флаг пропущен, JSON повреждён или содержит значение другого типа, кейс выполняется без секции рецептов.
+
 Browse tools должны быть доступны в Pi. При явном ограничении `--tools` включите **qa_plan, qa_checkpoint, qa_finish** и необходимые Browse tools.
 
 ## Контракт инструментов
